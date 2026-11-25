@@ -32,6 +32,12 @@ Put weights at `models/football_yolov8n.pt` (or train below).
 python capture/score_live.py --left 0 --right 1
 ```
 
+Pi / hand-held slow demo (much lighter YOLO):
+
+```bash
+python capture/score_live.py --left 0 --right 1 --slow-demo
+```
+
 1. Align — click bottom then top of the far post on each camera, Enter  
 2. Play — calls GOAL / WIDE / IN FIELD  
 3. I — instant replay  

@@ -59,6 +59,16 @@ PI_CAM_W, PI_CAM_H = 640, 480
 PI_REPLAY_S = 5.0
 PI_REPLAY_SCALE = 0.35
 
+# Hand-held slow demo (Pi): tiny YOLO, rare runs — fine if the ball barely moves.
+SLOW_IMGSZ = 160
+SLOW_YOLO_STRIDE = 16
+SLOW_SEARCH_STRIDE = 8
+SLOW_NEAR_STRIDE = 5
+SLOW_STALE_FRAMES = 40
+SLOW_CAM_W, SLOW_CAM_H = 480, 360
+SLOW_REPLAY_S = 4.0
+SLOW_REPLAY_SCALE = 0.3
+
 
 def is_raspberry_pi() -> bool:
     if platform.system() != "Linux":
@@ -220,13 +230,34 @@ def main() -> int:
     parser.add_argument("--replay-s", type=float, default=None)
     parser.add_argument("--cam-width", type=int, default=None)
     parser.add_argument("--cam-height", type=int, default=None)
+    parser.add_argument(
+        "--slow-demo",
+        action="store_true",
+        help="Hand-held slow ball on Pi: tiny YOLO, rare runs, smaller cams",
+    )
     parser.add_argument("--no-motion-gate", action="store_true")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
+    slow = bool(args.slow_demo)
+    if slow:
+        if args.imgsz == plane.IMAGE_SIZE:
+            args.imgsz = SLOW_IMGSZ
+        if args.yolo_stride == plane.IDLE_YOLO_STRIDE:
+            args.yolo_stride = SLOW_YOLO_STRIDE
+        if args.cam_width is None:
+            args.cam_width = SLOW_CAM_W
+        if args.cam_height is None:
+            args.cam_height = SLOW_CAM_H
+        if args.replay_s is None:
+            args.replay_s = SLOW_REPLAY_S
+
     cam_w = args.cam_width if args.cam_width is not None else (PI_CAM_W if on_pi else None)
     cam_h = args.cam_height if args.cam_height is not None else (PI_CAM_H if on_pi else None)
-    replay_scale = PI_REPLAY_SCALE if on_pi else REPLAY_SCALE
+    if slow:
+        replay_scale = SLOW_REPLAY_SCALE
+    else:
+        replay_scale = PI_REPLAY_SCALE if on_pi else REPLAY_SCALE
     if args.replay_s is None:
         args.replay_s = PI_REPLAY_S if on_pi else REPLAY_S
 
@@ -255,10 +286,13 @@ def main() -> int:
     rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
     if rotate_deg not in (0, 90, 270):
         rotate_deg = 90
-    yolo_imgsz = max(160, int(args.imgsz))
+    yolo_imgsz = max(128, int(args.imgsz))
     yolo_device = str(args.device)
     motion_gate = not bool(args.no_motion_gate)
     replay_s = max(2.0, float(args.replay_s))
+    search_stride = SLOW_SEARCH_STRIDE if slow else plane.SEARCH_STRIDE
+    near_stride = SLOW_NEAR_STRIDE if slow else plane.NEAR_STRIDE
+    stale_frames = SLOW_STALE_FRAMES if slow else plane.STALE_DET_FRAMES
 
     clicks = plane.ClickState()
     clicks.mode = "far"
@@ -271,7 +305,12 @@ def main() -> int:
     model: YOLO | None = None
     ball_classes: list[int] | None = None
     ball_dets: tuple = (None, None)
-    ball_sched = plane.BallDetectScheduler(idle_stride=int(args.yolo_stride))
+    ball_sched = plane.BallDetectScheduler(
+        idle_stride=int(args.yolo_stride),
+        search_stride=search_stride,
+        near_stride=near_stride,
+        stale_frames=stale_frames,
+    )
     motion_l = SkyMotionDetector(warmup_frames=8)
     motion_r = SkyMotionDetector(warmup_frames=8)
     ball_latch: dict = {"prev_z": None, "latch": None, "latch_until": 0.0}
@@ -301,10 +340,12 @@ def main() -> int:
 
     cap_l = cap_r = None
     try:
-        if on_pi:
+        if slow or on_pi:
+            tag = "slow-demo" if slow else "Raspberry Pi"
             print(
-                f"Raspberry Pi mode: cam {cam_w}x{cam_h}, imgsz={yolo_imgsz}, "
-                f"device={yolo_device}, stride={int(args.yolo_stride)}"
+                f"{tag}: cam {cam_w}x{cam_h}, imgsz={yolo_imgsz}, "
+                f"device={yolo_device}, stride={int(args.yolo_stride)}, "
+                f"near={near_stride}, search={search_stride}"
             )
         print(f"\nOpening left camera ({args.left})...")
         cap_l = plane.open_camera(args.left, width=cam_w, height=cam_h)

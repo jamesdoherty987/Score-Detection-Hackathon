@@ -751,10 +751,12 @@ class BallDetectScheduler:
         idle_stride: int = IDLE_YOLO_STRIDE,
         search_stride: int = SEARCH_STRIDE,
         near_stride: int = NEAR_STRIDE,
+        stale_frames: int = STALE_DET_FRAMES,
     ) -> None:
         self.idle_stride = max(1, int(idle_stride))
         self.search_stride = max(1, int(search_stride))
         self.near_stride = max(1, int(near_stride))
+        self.stale_frames = max(1, int(stale_frames))
         self.frame_i = 0
         self.since_yolo = 10**9
         self.last_dets: tuple = (None, None)
@@ -822,7 +824,7 @@ class BallDetectScheduler:
 
     def note_track(self, xyz: np.ndarray | None, now: float) -> None:
         if xyz is None:
-            if self.since_yolo >= STALE_DET_FRAMES:
+            if self.since_yolo >= self.stale_frames:
                 self.last_xyz = None
                 self.prev_xyz = None
                 self.last_xyz_t = None
@@ -839,7 +841,7 @@ class BallDetectScheduler:
         self.armed_until = max(self.armed_until, self.frame_i + ARM_AFTER_MOTION)
 
     def held_dets(self) -> tuple:
-        if self.since_yolo > STALE_DET_FRAMES:
+        if self.since_yolo > self.stale_frames:
             return (None, None)
         return self.last_dets
 
