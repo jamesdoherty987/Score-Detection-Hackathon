@@ -1,6 +1,6 @@
+# PC / laptop (Python 3.11). On Raspberry Pi see README (lighter install).
 opencv-python==4.10.0.84
 ultralytics==8.3.70
 torch==2.3.1
 torchvision==0.18.1
 numpy<2
-lap>=0.5.12

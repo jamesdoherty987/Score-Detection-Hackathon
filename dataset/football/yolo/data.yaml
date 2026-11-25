@@ -1,7 +1,8 @@
-﻿# Hawkeye football dataset (Roboflow YOLOv8 export)
-path: C:\Users\jkdoh\VSCodeProjects\Hawkeye\dataset\football\yolo
+# Gaelic football YOLOv8 dataset
+path: .
 train: train/images
 val: train/images
+test: test/images
 
 nc: 1
 names: ['football']

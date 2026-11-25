@@ -1,5 +1,5 @@
 """
-stereo_config.py — Central configuration for the Hawkeye stereo rig.
+stereo_config.py — Central configuration for the stereo camera rig.
 
 Edit this file whenever the physical rig changes (baseline, angles, lens).
 Stereo scripts read their defaults from here.
@@ -156,7 +156,7 @@ def print_summary(
     ray, h_post, slant = lowest_visible_on_far_post(behind_m=behind)
     print(
         f"\n{'─'*60}\n"
-        f"  Hawkeye stereo rig  (cameras SIDEWAYS)\n"
+        f"  Stereo camera rig  (cameras SIDEWAYS)\n"
         f"{'─'*60}\n"
         f"  Datasheet : {DATASHEET_HFOV_DEG}° / {DATASHEET_VFOV_DEG}° at "
         f"{DATASHEET_WIDTH}×{DATASHEET_HEIGHT}\n"

@@ -55,7 +55,7 @@ COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
 IMAGE_SIZE = 640
 CONFIDENCE = 0.30
-WINDOW = "Hawkeye Stereo Calibrate — C calibrate | Q quit"
+WINDOW = "Stereo Calibrate — C calibrate | Q quit"
 
 SMOOTH_N = 6             # median smoothing window for 3D position
 

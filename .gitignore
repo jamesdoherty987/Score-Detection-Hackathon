@@ -6,28 +6,22 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# YOLO / Ultralytics
+# YOLO / Ultralytics weights & run logs (keep labeled images)
 *.pt
 runs/
 weights/
+training/runs/
 
 # OS / IDE
 .DS_Store
 .idea/
 .vscode/
 
-# Captured data (keep folder structure, ignore images)
-dataset/**/detections/*.jpg
-dataset/**/detections/*.jpeg
-dataset/**/detections/*.png
-dataset/**/images/
-dataset/**/labels/
-#dataset/**/videos/*.mp4
-dataset/**/*.zip
-dataset/**/yolo/train/
-dataset/**/yolo/valid/
-dataset/**/yolo/test/
-!dataset/**/raw/.gitkeep
+# Local notes
+EXPLAINER.md
+
+# Local exports / captures
 exports/**/*.mp4
 exports/**/*.csv
 !exports/**/.gitkeep
+!exports/stereo/plane.json

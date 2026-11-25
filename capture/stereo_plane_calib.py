@@ -1,9 +1,8 @@
 """
-stereo_plane_calib.py — Draw / verify the goal plane (test only).
+stereo_plane_calib.py — Goal plane align / verify helpers (also used by score_live).
 
-Does NOT change stereo_record or stereo_calibrate. Use this to check that
-the goal plane (between the posts, extended upward) projects correctly
-into both camera views with your current stereo_config angles.
+Draws the goal plane (between the posts, extended upward) into both camera
+views using stereo_config angles.
 
 Assumptions
 ───────────
@@ -94,19 +93,22 @@ STILL_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
-IMAGE_SIZE = 416              # live default; override with --imgsz
+IMAGE_SIZE = 256              # small default (Pi-friendly); override with --imgsz
 CONFIDENCE = 0.30
-WINDOW = "Hawkeye Plane"
+WINDOW = "Goal Plane"
 
 PLANE_CROSS_M = 0.05
 POST_MARGIN_M = 0.02          # extra width beyond ±baseline/2 still called "between"
 REPROJ_MAX_PX = 40.0          # reject 3D if it doesn't land on both detections
 CALL_LATCH_S = 1.2
-NEAR_PLANE_Z_M = 1.25         # |Z| below this → YOLO every frame
-FAST_SPEED_M_S = 4.0          # 3D speed above this → YOLO every frame
-IDLE_YOLO_STRIDE = 3          # deep-field / coasting: run every N frames
-ARM_AFTER_MOTION = 20         # keep detector hot this many frames after motion
-STALE_DET_FRAMES = 12         # drop held boxes if YOLO hasn't run this long
+NEAR_PLANE_Z_M = 1.25         # |Z| below this → YOLO every NEAR_STRIDE frames
+FAST_SPEED_M_S = 4.0          # 3D speed above this → treat like near-plane
+IDLE_YOLO_STRIDE = 6          # deep-field / coasting: run every N frames
+SEARCH_STRIDE = 3             # hunting after motion, before a 3D track exists
+NEAR_STRIDE = 1               # at the posts: keep every frame for score calls
+ARM_AFTER_MOTION = 12         # keep detector hot this many frames after motion
+STALE_DET_FRAMES = 18         # drop held boxes if YOLO hasn't run this long
+YOLO_DEVICE = "cpu"           # Pi has no CUDA; PCs can pass --device 0
 COL_GRID = (80, 200, 80)
 COL_POST = (0, 255, 255)
 COL_BAR = (0, 180, 255)
@@ -192,7 +194,11 @@ def _backends() -> list[tuple[str, int]]:
     return [("MSMF", cv2.CAP_MSMF), ("DirectShow", cv2.CAP_DSHOW), ("default", cv2.CAP_ANY)]
 
 
-def open_camera(index: int) -> cv2.VideoCapture:
+def open_camera(
+    index: int,
+    width: int | None = None,
+    height: int | None = None,
+) -> cv2.VideoCapture:
     last_err = f"Could not open camera {index}."
     for name, backend in _backends():
         print(f"  Trying camera {index} via {name}...")
@@ -202,6 +208,10 @@ def open_camera(index: int) -> cv2.VideoCapture:
             continue
         try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
         try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
+        if width is not None:
+            try_set(cap, cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        if height is not None:
+            try_set(cap, cv2.CAP_PROP_FRAME_HEIGHT, float(height))
         ok, frame = False, None
         for _ in range(20):
             ok, frame = cap.read()
@@ -683,7 +693,12 @@ def load_ball_model(model_str: str) -> tuple[YOLO, list[int] | None]:
             path = full
     is_coco = path.name == COCO_MODEL
     print(f"Loading {'COCO sports-ball' if is_coco else 'custom'} model: {path}")
-    return YOLO(str(path)), ([SPORTS_BALL_CLASS] if is_coco else None)
+    model = YOLO(str(path))
+    try:
+        model.fuse()
+    except Exception:
+        pass
+    return model, ([SPORTS_BALL_CLASS] if is_coco else None)
 
 
 def detect_both(
@@ -693,8 +708,16 @@ def detect_both(
     conf: float,
     classes: list[int] | None,
     imgsz: int = IMAGE_SIZE,
+    device: str = YOLO_DEVICE,
 ):
-    kw: dict = dict(conf=conf, imgsz=int(imgsz), verbose=False)
+    kw: dict = dict(
+        conf=conf,
+        imgsz=int(imgsz),
+        verbose=False,
+        device=device,
+        max_det=1,
+        half=False,
+    )
     if classes:
         kw["classes"] = classes
     results = model.predict([frame_l, frame_r], **kw)
@@ -715,16 +738,23 @@ def detect_both(
 
 class BallDetectScheduler:
     """
-    Motion-gated YOLO with adaptive stride.
+    Motion-gated YOLO with adaptive stride (keeps YOLO rare).
 
-    - Idle (no motion, no track): skip YOLO entirely.
-    - First motion frame: run YOLO immediately (no delay).
-    - Near plane or moving fast: every frame.
-    - Deep in field / coasting: every idle_stride frames; reuse last boxes.
+    - Idle: skip entirely.
+    - New motion / search (no 3D yet): first frame immediately, then SEARCH_STRIDE.
+    - Near plane or fast: every NEAR_STRIDE frames (default 1 — needed for calls).
+    - Coasting deep in field: every idle_stride frames; reuse last boxes.
     """
 
-    def __init__(self, idle_stride: int = IDLE_YOLO_STRIDE) -> None:
+    def __init__(
+        self,
+        idle_stride: int = IDLE_YOLO_STRIDE,
+        search_stride: int = SEARCH_STRIDE,
+        near_stride: int = NEAR_STRIDE,
+    ) -> None:
         self.idle_stride = max(1, int(idle_stride))
+        self.search_stride = max(1, int(search_stride))
+        self.near_stride = max(1, int(near_stride))
         self.frame_i = 0
         self.since_yolo = 10**9
         self.last_dets: tuple = (None, None)
@@ -755,29 +785,32 @@ class BallDetectScheduler:
             self.last_mode = "force"
             return True, self.last_mode
 
+        was_idle = self.frame_i > self.armed_until
         if has_motion:
             self.armed_until = self.frame_i + ARM_AFTER_MOTION
-            self.last_mode = "motion"
-            return True, self.last_mode
 
         near = False
-        fast = getattr(self, "_last_speed", 0.0) >= FAST_SPEED_M_S
+        fast = self._last_speed >= FAST_SPEED_M_S
         if self.last_xyz is not None:
             near = abs(float(self.last_xyz[2])) <= NEAR_PLANE_Z_M
 
+        # Score zone — still frequent so GOAL/WIDE calls stay reliable.
         if near or fast:
             self.armed_until = max(self.armed_until, self.frame_i + ARM_AFTER_MOTION)
             self.last_mode = "near" if near else "fast"
-            return True, self.last_mode
+            return self.since_yolo >= self.near_stride, self.last_mode
 
-        if self.frame_i <= self.armed_until and self.last_xyz is not None:
+        # Have a track but deep / coasting — rare YOLO.
+        if self.last_xyz is not None and self.frame_i <= self.armed_until:
             self.last_mode = "coast"
             return self.since_yolo >= self.idle_stride, self.last_mode
 
-        if self.frame_i <= self.armed_until:
-            # Motion recently but no 3D yet — keep scanning every frame briefly
-            self.last_mode = "search"
-            return True, self.last_mode
+        # Motion wake or brief search with no 3D yet.
+        if has_motion or self.frame_i <= self.armed_until:
+            self.last_mode = "motion" if has_motion else "search"
+            if was_idle and has_motion:
+                return True, self.last_mode
+            return self.since_yolo >= self.search_stride, self.last_mode
 
         self.last_mode = "idle"
         return False, self.last_mode
@@ -1237,11 +1270,15 @@ def main() -> int:
     parser.add_argument("--conf", type=float, default=CONFIDENCE)
     parser.add_argument(
         "--imgsz", type=int, default=IMAGE_SIZE,
-        help=f"YOLO inference size (default {IMAGE_SIZE}; try 320 for more FPS)",
+        help=f"YOLO inference size (default {IMAGE_SIZE}; lower = faster)",
     )
     parser.add_argument(
         "--yolo-stride", type=int, default=IDLE_YOLO_STRIDE,
-        help="When ball is deep in field, run YOLO every N frames (default 3)",
+        help=f"When ball is deep in field, run YOLO every N frames (default {IDLE_YOLO_STRIDE})",
+    )
+    parser.add_argument(
+        "--device", type=str, default=YOLO_DEVICE,
+        help="YOLO device (cpu or 0)",
     )
     parser.add_argument("--no-ball", action="store_true", help="Start with ball detection off (B toggles)")
     parser.add_argument(
@@ -1534,7 +1571,13 @@ def main() -> int:
                     run_yolo, _yolo_mode = ball_sched.should_run(has_motion, now, force=force)
                     if run_yolo:
                         ball_dets = detect_both(
-                            model, view_l, view_r, args.conf, ball_classes, imgsz=yolo_imgsz,
+                            model,
+                            view_l,
+                            view_r,
+                            args.conf,
+                            ball_classes,
+                            imgsz=yolo_imgsz,
+                            device=str(args.device),
                         )
                         ball_sched.note_yolo(ball_dets, now)
                         xyz = estimate_ball_xyz(

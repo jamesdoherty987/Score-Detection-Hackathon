@@ -1,123 +1,54 @@
-# Hawkeye
+# Score Detection
 
-Final year project — detecting a football (and later a sliotar) with a camera + YOLOv8.
+Gaelic football score detection with two cameras and a small YOLOv8n ball model.
 
-Works with an Arducam UC-844 USB camera on Mac, Windows, or Raspberry Pi (OpenCV, not Picamera2).
+YOLO only runs when something moves, at a small image size, and rarely when the ball is deep in the field. Near the posts it stays frequent so GOAL / WIDE calls still work.
 
 ## Setup
 
-Use **Python 3.11** (3.14 cannot install the pinned torch build).
+Python 3.11 (PC):
 
 ```bash
-git clone https://github.com/jamesdoherty987/Hawkeye.git
-cd Hawkeye
-python3.11 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-On Pi you might also need:
+Raspberry Pi (desktop OS + screen):
 
 ```bash
 sudo apt install -y python3-venv python3-pip libgl1 libglib2.0-0
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install ultralytics opencv-python "numpy<2"
 ```
 
-Copy `models/football_yolov8n.pt` onto the machine if you already trained (do not retrain just to move).
+Put weights at `models/football_yolov8n.pt` (or train below).
 
-## Scripts
-
-**Record video (pitch / outdoor)**
+## Run
 
 ```bash
-python capture/record_video.py
+python capture/score_live.py --left 0 --right 1
 ```
 
-- R = start/stop recording → `dataset/football/videos/`
-- Q = quit
-- Exposure auto-adjusts from scene brightness
+1. Align — click bottom then top of the far post on each camera, Enter  
+2. Play — calls GOAL / WIDE / IN FIELD  
+3. I — instant replay  
 
-**Review a video and save ball frames by hand**
+## Dataset & train
 
-```bash
-python capture/review_video.py dataset/football/videos/football_000003.mp4
+```
+dataset/football/yolo/
+  train/images   train/labels   ← labeled training set
+  test/images    test/labels    ← optional hold-out set
+dataset/football/raw/           ← drop new stills here before labeling
 ```
 
-- SPACE = save frame → `dataset/football/raw/`
-- A / D = back / forward 3 seconds
-- P = pause | Q = quit
-
-**Auto-extract every Nth frame from all videos**
-
-```bash
-python capture/extract_frames.py
-python capture/extract_frames.py --every 8
-```
-
-**Still capture (SPACE to save)**
-
-```bash
-python capture/capture_images.py
-```
-
-**Live detect with your trained model**
-
-```bash
-python capture/test_detect.py
-```
-
-- Loads `models/football_yolov8n.pt`
-- Draws a box on the ball
-- Saves every frame with a ball to `dataset/football/detections/`
-- Q = quit
-
-**Detect + track path (Phase 1 — single camera)**
-
-```bash
-python capture/track_video.py dataset/football/videos/football_000003.mp4
-python capture/track_video.py dataset/football/videos/football_000003.mp4 --save-video
-python capture/track_video.py --camera
-```
-
-Uses **YOLO + ByteTrack** (built into Ultralytics). Draws a trail, speed (px/s), and direction. Saves path CSV to `exports/football/paths/`. Annotated video (optional) → `exports/football/tracked/`.
-
-If the wrong camera opens, use `--camera-index 1` (track) or change `CAMERA_INDEX` in `test_detect.py`.
-
-**Train (after Roboflow YOLOv8 export is in `dataset/football/yolo/`)**
+Add more data: put new images in `raw/`, label them (YOLO txt format), then copy each image + label into `train/images` and `train/labels`.
 
 ```bash
 python training/train_football.py
 ```
 
-Best weights → `models/football_yolov8n.pt`
-
-## Folders
-
-- `capture/` — camera + detection scripts
-- `dataset/football/raw/` — hand-picked / extracted stills
-- `dataset/football/videos/` — recorded clips
-- `dataset/football/yolo/` — labeled Roboflow export (train/valid)
-- `dataset/football/detections/` — frames saved when live detect sees a ball
-- `exports/football/tracked/` — annotated videos with ball trail
-- `exports/football/paths/` — CSV path data (frame, time, x, y)
-- `dataset/sliotar/` — for later
-- `training/` / `models/` / `exports/` — training output
-
-## Data collection (what goes where)
-
-| Goal | What to collect | Where it goes | Then |
-|------|-----------------|---------------|------|
-| **Train detector** | Ball in frame (still + moving) | `dataset/football/raw/` via review/capture | Label in Roboflow → export to `dataset/football/yolo/` → retrain |
-| **Hard negatives** | Heads, cups, empty pitch — **no box** | Same Roboflow project, upload, leave unlabeled | Retrain — reduces false positives |
-| **Test tracking** | Clips with ball crossing the frame | `dataset/football/videos/` | Run `track_video.py` on them |
-| **More moving ball** | Kicks, rolls, far + close | Record → review video → save key frames **and** keep full videos for tracking | Both labeling and `track_video.py` |
-
-You do **not** need 1000 images. Aim for ~200–400 labeled ball images + ~50–100 negatives, plus a few good pitch videos for tracking tests.
-
-Tracking quality depends on detection — improve the model first if the trail keeps breaking.
-
-## Next steps
-
-1. Improve dataset (negatives + varied ball shots) and retrain
-2. Run `track_video.py` on your pitch videos; tune `CONFIDENCE` in `track_video.py`
-3. Same pipeline for sliotar later
-4. Phase 2: camera calibration + ground plane; Phase 3: second camera + 3D
+Best weights are copied to `models/football_yolov8n.pt`.
