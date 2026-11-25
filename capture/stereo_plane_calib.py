@@ -76,7 +76,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from auto_exposure import try_set
+from auto_exposure import try_get, try_set
 import stereo_config as cfg
 from sky_motion import SkyMotionDetector
 from stereo_calibrate import (
@@ -185,6 +185,11 @@ def label_world_point(
 
 # ─── Camera helpers (same pattern as other stereo scripts) ───────────────────
 
+# Dual UVC cams (e.g. Arducam OV9281) need MJPEG at modest res or V4L2 times out.
+DEFAULT_CAM_W, DEFAULT_CAM_H = 640, 480
+DEFAULT_CAM_FPS = 30.0
+
+
 def _backends() -> list[tuple[str, int]]:
     s = platform.system()
     if s == "Darwin":
@@ -194,42 +199,73 @@ def _backends() -> list[tuple[str, int]]:
     return [("MSMF", cv2.CAP_MSMF), ("DirectShow", cv2.CAP_DSHOW), ("default", cv2.CAP_ANY)]
 
 
+def _fourcc_mjpg() -> float:
+    return float(cv2.VideoWriter_fourcc(*"MJPG"))
+
+
+def configure_capture(
+    cap: cv2.VideoCapture,
+    width: int = DEFAULT_CAM_W,
+    height: int = DEFAULT_CAM_H,
+    fps: float = DEFAULT_CAM_FPS,
+) -> None:
+    """Force MJPEG + resolution before streaming (critical for dual USB on Pi)."""
+    mjpg = _fourcc_mjpg()
+    # FourCC before size — some UVC drivers ignore MJPG if set after.
+    try_set(cap, cv2.CAP_PROP_FOURCC, mjpg)
+    try_set(cap, cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    try_set(cap, cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    try_set(cap, cv2.CAP_PROP_FPS, float(fps))
+    # Buffer 1 is fragile with two cams contending for USB; keep a couple frames.
+    try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 2.0)
+    try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    # Re-assert after geometry — drivers often reset FOURCC on size change.
+    try_set(cap, cv2.CAP_PROP_FOURCC, mjpg)
+
+
 def open_camera(
     index: int,
     width: int | None = None,
     height: int | None = None,
 ) -> cv2.VideoCapture:
+    w = DEFAULT_CAM_W if width is None else int(width)
+    h = DEFAULT_CAM_H if height is None else int(height)
     last_err = f"Could not open camera {index}."
     for name, backend in _backends():
-        print(f"  Trying camera {index} via {name}...")
+        print(f"  Trying camera {index} via {name} (MJPG {w}×{h})...")
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             cap.release()
             continue
-        try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
-        try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
-        if width is not None:
-            try_set(cap, cv2.CAP_PROP_FRAME_WIDTH, float(width))
-        if height is not None:
-            try_set(cap, cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        configure_capture(cap, width=w, height=h)
         ok, frame = False, None
-        for _ in range(20):
+        for _ in range(30):
             ok, frame = cap.read()
-            if ok and frame is not None and frame.any():
+            if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
                 break
-            time.sleep(0.05)
-        if ok and frame is not None and frame.any():
-            h, w = frame.shape[:2]
-            print(f"  Camera {index} OK via {name} — {w}×{h}")
+            time.sleep(0.03)
+        if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
+            fh, fw = frame.shape[:2]
+            fourcc = int(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
+            fourcc_s = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4))
+            print(f"  Camera {index} OK via {name} — {fw}×{fh} fourcc={fourcc_s!r}")
             return cap
         cap.release()
-        last_err = f"Camera {index} via {name}: no valid frames."
+        last_err = f"Camera {index} via {name}: no valid frames (tried MJPG {w}×{h})."
     raise RuntimeError(last_err)
 
 
-def read_cam(cap: cv2.VideoCapture) -> tuple[bool, np.ndarray | None]:
-    ok, frame = cap.read()
-    return (True, frame) if (ok and frame is not None) else (False, None)
+def read_cam(
+    cap: cv2.VideoCapture,
+    retries: int = 5,
+) -> tuple[bool, np.ndarray | None]:
+    """Read one frame; retry briefly on V4L2 hiccups (dual-cam USB stalls)."""
+    for _ in range(max(1, int(retries))):
+        ok, frame = cap.read()
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return True, frame
+        time.sleep(0.01)
+    return False, None
 
 
 def resolve_media_path(raw: str, kind: str) -> Path:

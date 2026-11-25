@@ -65,7 +65,8 @@ SLOW_YOLO_STRIDE = 16
 SLOW_SEARCH_STRIDE = 8
 SLOW_NEAR_STRIDE = 5
 SLOW_STALE_FRAMES = 40
-SLOW_CAM_W, SLOW_CAM_H = 480, 360
+# Keep 640x480 MJPEG (proven with OV9281); lower res can pick a bad UVC mode.
+SLOW_CAM_W, SLOW_CAM_H = 640, 480
 SLOW_REPLAY_S = 4.0
 SLOW_REPLAY_SCALE = 0.3
 
@@ -204,7 +205,8 @@ def main() -> int:
     on_pi = is_raspberry_pi()
     parser = argparse.ArgumentParser(description="Score live: Align → Play → Replay")
     parser.add_argument("--left", type=int, default=0)
-    parser.add_argument("--right", type=int, default=1)
+    # OV9281 pair: video0 + video2 (video1/3 are metadata nodes, not capture).
+    parser.add_argument("--right", type=int, default=2)
     parser.add_argument("--baseline", type=float, default=cfg.BASELINE_M)
     parser.add_argument("--behind", type=float, default=cfg.CAM_BEHIND_POST_M)
     parser.add_argument("--h-angle", type=float, default=cfg.H_ANGLE_DEG)
@@ -347,18 +349,34 @@ def main() -> int:
                 f"device={yolo_device}, stride={int(args.yolo_stride)}, "
                 f"near={near_stride}, search={search_stride}"
             )
-        print(f"\nOpening left camera ({args.left})...")
+        # Always request an explicit size so configure_capture can lock MJPEG.
+        cam_w = plane.DEFAULT_CAM_W if cam_w is None else int(cam_w)
+        cam_h = plane.DEFAULT_CAM_H if cam_h is None else int(cam_h)
+
+        print(f"\nOpening left camera ({args.left}) @ MJPG {cam_w}×{cam_h}...")
         cap_l = plane.open_camera(args.left, width=cam_w, height=cam_h)
-        time.sleep(0.4)
-        print(f"Opening right camera ({args.right})...")
+        time.sleep(0.3)
+        print(f"Opening right camera ({args.right}) @ MJPG {cam_w}×{cam_h}...")
         cap_r = plane.open_camera(args.right, width=cam_w, height=cam_h)
-        ok_l, probe_l = plane.read_cam(cap_l)
-        ok_r, probe_r = plane.read_cam(cap_r)
-        if not ok_l or probe_l is None or not ok_r or probe_r is None:
-            print("ERROR: could not read initial frames.", file=sys.stderr)
+        # Warm both streams together so USB/MJPEG settles before the UI loop.
+        probe_l = probe_r = None
+        for _ in range(15):
+            ok_l, probe_l = plane.read_cam(cap_l, retries=2)
+            ok_r, probe_r = plane.read_cam(cap_r, retries=2)
+            if ok_l and ok_r and probe_l is not None and probe_r is not None:
+                break
+            time.sleep(0.05)
+        if probe_l is None or probe_r is None:
+            print(
+                "ERROR: could not read initial frames from both cameras.\n"
+                "  Tip: use capture nodes (often --left 0 --right 2); "
+                "metadata nodes like /dev/video1 will time out.",
+                file=sys.stderr,
+            )
             return 1
         raw_wh_l = (probe_l.shape[1], probe_l.shape[0])
         raw_wh_r = (probe_r.shape[1], probe_r.shape[0])
+        print(f"  Dual stream OK — L {raw_wh_l[0]}×{raw_wh_l[1]}  R {raw_wh_r[0]}×{raw_wh_r[1]}")
 
         view_l = plane.orient_frame(probe_l, rotate_deg)
         view_r = plane.orient_frame(probe_r, rotate_deg)
