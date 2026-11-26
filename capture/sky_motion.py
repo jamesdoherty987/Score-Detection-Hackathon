@@ -11,7 +11,6 @@ fast objects are better served by frame differencing than slow-adapting MOG2.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import cv2
@@ -170,76 +169,3 @@ class SkyMotionDetector:
             ready=ready,
             mask=mask if return_mask else None,
         )
-
-
-def box_overlaps_motion(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    blobs: list[MotionBlob],
-) -> float:
-    """
-    Best overlap score in [0, 1] between a box and any motion blob.
-
-    Uses max of centre-inside-blob and IoU.
-    """
-    if not blobs:
-        return 0.0
-
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    box_area = max((x2 - x1) * (y2 - y1), 1.0)
-    best = 0.0
-
-    for blob in blobs:
-        if blob.x1 <= cx <= blob.x2 and blob.y1 <= cy <= blob.y2:
-            return 1.0
-
-        ix1 = max(x1, blob.x1)
-        iy1 = max(y1, blob.y1)
-        ix2 = min(x2, blob.x2)
-        iy2 = min(y2, blob.y2)
-        iw = max(0.0, ix2 - ix1)
-        ih = max(0.0, iy2 - iy1)
-        inter = iw * ih
-        union = box_area + blob.area - inter
-        iou = inter / max(union, 1.0)
-        best = max(best, iou)
-
-    return best
-
-
-def nearest_motion_blob(
-    blobs: list[MotionBlob],
-    point: tuple[float, float],
-    max_distance: float,
-) -> MotionBlob | None:
-    if not blobs:
-        return None
-
-    px, py = point
-    best: MotionBlob | None = None
-    best_dist = max_distance
-
-    for blob in blobs:
-        dist = math.hypot(blob.cx - px, blob.cy - py)
-        if dist <= best_dist:
-            best_dist = dist
-            best = blob
-
-    return best
-
-
-def draw_motion_overlay(frame: np.ndarray, motion: MotionResult) -> None:
-    """Draw motion blobs (green) and optional mask tint for debugging."""
-    for blob in motion.blobs:
-        cv2.rectangle(
-            frame,
-            (blob.x1, blob.y1),
-            (blob.x2, blob.y2),
-            (0, 220, 0),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.circle(frame, (int(blob.cx), int(blob.cy)), 3, (0, 220, 0), -1)

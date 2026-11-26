@@ -1,74 +1,17 @@
 """
-stereo_plane_calib.py — Goal plane align / verify helpers (also used by score_live).
+stereo_plane_calib.py — Shared helpers for score_live (plane, cams, ball).
 
-Draws the goal plane (between the posts, extended upward) into both camera
-views using stereo_config angles.
+Draws the goal plane, opens dual UVC cameras, aligns far-post clicks, and
+runs YOLO + stereo triangulation for GOAL / WIDE calls.
 
-Assumptions
-───────────
-  Cameras clamp at the post–crossbar corners, on the BACK of the posts.
-  Goal plane = posts + crossbar (Z = 0), extended UP for high balls.
-  Left post  at X = −baseline/2,  right post at X = +baseline/2.
-  Cameras share that X/Y but sit CAM_BEHIND_POST_M behind the wood (Z < 0).
-  Crossbar height ≈ camera height (Y = 0).
-
-  LEFT / RIGHT are from BEHIND the goal, looking into the field
-  (goalkeeper's left/right). N on each camera points into the FIELD.
-
-Controls
-────────
-  Click LEFT panel  = mark a point on the LEFT camera image
-  Click RIGHT panel = mark a point on the RIGHT camera image
-
-  F = next clicks are FAR post (default). Click BOTTOM of the post, then TOP.
-      The whole overlay (yellow posts + orange crossbar) slides with the yellow line.
-  K = re-snap if you moved the clicks
-  N = next clicks are NEAR post
-  C = clear all click marks
-
-  [ / ] = decrease / increase H_ANGLE by 1°
-  - / = = decrease / increase V_ANGLE by 1°
-  , / . = decrease / increase plane height extension (metres)
-  R     = reset angles to stereo_config defaults
-  B     = toggle ball detection (on by default)
-          Motion wakes YOLO on the same frame (no delay). Near the plane /
-          fast ball → every frame; deep field → every few frames; idle → off.
-          BLUE flash = ball seen, still in front of the plane
-          GREEN      = ball has gone THROUGH between the posts
-          RED        = ball has gone THROUGH but wide of the posts
-  D     = toggle landmark distance labels on the plane
-  S     = save plane overlay params → exports/stereo/plane.json
-  L     = load plane.json if present
-  Q/ESC = quit
-
-  Video mode only:
-  SPACE = pause / play
-  A / D = back / forward ~1 second (both files stay in sync)
-  Videos loop when either file ends.
-
-  Image mode is a frozen pair (jpg/png/…). Same overlay tools; no seek.
-
-  Sideways cameras: landscape frames (w > h) are rotated so the 70° FOV is
-  vertical. Already-portrait files are left as-is. The full frame is always
-  shown (letterboxed); the status bar sits under the pictures, not on them.
-  O = cycle rotate 90° CW / 270° CCW / off
-  U = toggle upside-down flip
-
-Usage
-─────
-  python capture/stereo_plane_calib.py --left 0 --right 1
-  python capture/stereo_plane_calib.py --video-left left.mp4 --video-right right.mp4
-  python capture/stereo_plane_calib.py --image-left left.jpg --image-right right.jpg --rotate 270
-  python capture/stereo_plane_calib.py --list
+Not a standalone app — run: python capture/score_live.py
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import platform
-import sys
 import threading
 import time
 from pathlib import Path
@@ -79,24 +22,19 @@ from ultralytics import YOLO
 
 from auto_exposure import try_get, try_set
 import stereo_config as cfg
-from sky_motion import SkyMotionDetector
 from stereo_calibrate import (
-    make_proj_matrix,
     project_world,
     triangulate_3d,
     calib_centres_from_dets,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PLANE_PATH = PROJECT_ROOT / "exports" / "stereo" / "plane.json"
-STILL_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
 IMAGE_SIZE = 256              # small default (Pi-friendly); override with --imgsz
 CONFIDENCE = 0.30
-WINDOW = "Goal Plane"
 
 PLANE_CROSS_M = 0.05
 POST_MARGIN_M = 0.02          # extra width beyond ±baseline/2 still called "between"
@@ -113,76 +51,34 @@ YOLO_DEVICE = "cpu"           # Pi has no CUDA; PCs can pass --device 0
 COL_GRID = (80, 200, 80)
 COL_POST = (0, 255, 255)
 COL_BAR = (0, 180, 255)
-COL_EXT = (180, 255, 100)
 COL_CLICK_FAR = (0, 255, 0)
-COL_CLICK_NEAR = (255, 128, 0)
 COL_BALL = (0, 255, 255)
 COL_STATUS = (220, 220, 220)
 COL_DEBUG = (180, 255, 255)
-COL_DIST = (255, 255, 100)
 COL_CALL_BLUE = (255, 90, 20)     # BGR — in field, not yet through
 COL_CALL_GREEN = (0, 255, 80)     # through + between posts
 COL_CALL_RED = (0, 0, 255)        # through + wide
 
-
 def dist3(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
 
-
-def elevation_from_horizontal(cam_pos: np.ndarray, xyz: np.ndarray) -> float:
-    """Elevation angle of cam→point above the horizontal plane (degrees)."""
-    d = xyz - cam_pos
-    horiz = math.hypot(float(d[0]), float(d[2]))
-    if horiz < 1e-9:
-        return 90.0 if d[1] > 0 else (-90.0 if d[1] < 0 else 0.0)
-    return math.degrees(math.atan2(float(d[1]), horiz))
-
-
-def put_label(img: np.ndarray, text: str, org: tuple[int, int],
-              color=COL_DIST, scale=0.42, thick=1) -> None:
-    x, y = org
-    cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, thick, cv2.LINE_AA)
-
-
-def label_world_point(
+def put_label(
     img: np.ndarray,
-    P: np.ndarray,
-    xyz: np.ndarray,
-    pos_l: np.ndarray,
-    pos_r: np.ndarray,
-    name: str,
-    which_cam: str,
-    affine: np.ndarray | None = None,
+    text: str,
+    org: tuple[int, int],
+    color=COL_STATUS,
+    scale: float = 0.42,
+    thick: int = 1,
 ) -> None:
-    """
-    Project a world point and annotate distance to BOTH cameras plus elevation
-    from *this* camera (the feed we're drawing on).
-    """
-    uv = project_safe(P, xyz, affine)
-    if uv is None:
-        return
-    u, v = uv
-    if not (0 <= u < img.shape[1] and 0 <= v < img.shape[0]):
-        return
-    d_l = dist3(xyz, pos_l)
-    d_r = dist3(xyz, pos_r)
-    cam = pos_l if which_cam == "L" else pos_r
-    elev = elevation_from_horizontal(cam, xyz)
-    cv2.circle(img, (u, v), 5, COL_DIST, -1, cv2.LINE_AA)
-    # Two lines so it stays readable
-    put_label(img, f"{name}", (u + 8, v - 18), COL_POST, 0.45, 1)
-    put_label(
-        img,
-        f"dL={d_l:.2f}m dR={d_r:.2f}m  elev={elev:.0f}deg",
-        (u + 8, v + 4),
-        COL_DIST,
-        0.38,
-        1,
+    x, y = org
+    cv2.putText(
+        img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX,
+        scale, (0, 0, 0), thick + 2, cv2.LINE_AA,
     )
-
+    cv2.putText(
+        img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+        scale, color, thick, cv2.LINE_AA,
+    )
 
 # ─── Camera helpers (same pattern as other stereo scripts) ───────────────────
 
@@ -190,18 +86,15 @@ def label_world_point(
 DEFAULT_CAM_W, DEFAULT_CAM_H = 640, 480
 DEFAULT_CAM_FPS = 30.0
 
-
 def _fourcc_mjpg() -> int:
     # Must stay int — float() corrupts FOURCC values above 2^24.
     return int(cv2.VideoWriter_fourcc(*"MJPG"))
-
 
 def _fourcc_to_str(code: float | int) -> str:
     n = int(code)
     if n <= 0:
         return "?"
     return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4))
-
 
 def _is_capture_symlink_name(name: str) -> bool:
     """UVC capture nodes are usually *-video-index0; index1+ are often metadata."""
@@ -211,7 +104,6 @@ def _is_capture_symlink_name(name: str) -> bool:
     if "index" in lower:
         return False
     return True
-
 
 def list_linux_camera_links() -> list[dict[str, str]]:
     """Stable udev links under /dev/v4l/by-id and by-path (Linux/Pi)."""
@@ -237,7 +129,6 @@ def list_linux_camera_links() -> list[dict[str, str]]:
                 }
             )
     return rows
-
 
 def resolve_camera_source(spec: str | int) -> tuple[str, object, int]:
     """
@@ -295,7 +186,6 @@ def resolve_camera_source(spec: str | int) -> tuple[str, object, int]:
     link = links[0]["link"]
     return (f"V4L2 {link}", link, cv2.CAP_V4L2)
 
-
 def configure_capture(
     cap: cv2.VideoCapture,
     width: int = DEFAULT_CAM_W,
@@ -313,7 +203,6 @@ def configure_capture(
     try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 3.0)
     # Re-assert after geometry — drivers often reset FOURCC on size change.
     try_set(cap, cv2.CAP_PROP_FOURCC, mjpg)
-
 
 def open_camera(
     spec: str | int,
@@ -359,7 +248,6 @@ def open_camera(
     print(f"  OK — {fw}×{fh} fourcc={fourcc_s!r}  (single-cam read OK)")
     return cap
 
-
 def print_camera_list() -> None:
     """Print indexes + stable by-id/by-path links for --list."""
     print("Linux V4L camera links (prefer 'capture' + by-path if cams are identical):")
@@ -387,7 +275,6 @@ def print_camera_list() -> None:
             continue
         print(f"  {i}: {dev}")
 
-
 def read_cam(
     cap: cv2.VideoCapture,
     retries: int = 5,
@@ -402,7 +289,6 @@ def read_cam(
             return True, frame
         time.sleep(0.01)
     return False, None
-
 
 def probe_dual_stream(
     cap_l: cv2.VideoCapture,
@@ -441,7 +327,6 @@ def probe_dual_stream(
             "devices before any background reader, and prefer USB2/3 ports on different hubs."
         )
     return last_l, last_r
-
 
 class LatestFrameCam:
     """
@@ -494,21 +379,6 @@ class LatestFrameCam:
         except Exception:
             pass
 
-
-def resolve_media_path(raw: str, kind: str) -> Path:
-    p = Path(raw)
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
-    p = p.resolve()
-    if not p.is_file():
-        raise RuntimeError(f"{kind} not found: {p}")
-    return p
-
-
-def is_still_path(path: Path) -> bool:
-    return path.suffix.lower() in STILL_EXTS
-
-
 def normalize_orient(rotate_deg: int, flip_ud: bool = False) -> tuple[int, bool]:
     """Canonical orient: rotate in {0, 90, 270}, flip_ud bool.
 
@@ -522,7 +392,6 @@ def normalize_orient(rotate_deg: int, flip_ud: bool = False) -> tuple[int, bool]
     elif rd not in (0, 90, 270):
         rd = int(cfg.SIDEWAYS_ROTATE_DEG) if cfg.CAMERAS_SIDEWAYS else 0
     return rd, fu
-
 
 def orient_from_dict(
     data: dict,
@@ -541,7 +410,6 @@ def orient_from_dict(
     elif apply_flip and apply_rotate and int(data.get("rotate_deg", rd)) == 180:
         fu = True
     return normalize_orient(rd, fu)
-
 
 def orient_frame(
     frame: np.ndarray,
@@ -562,7 +430,6 @@ def orient_frame(
         out = cv2.rotate(out, cv2.ROTATE_180)
     return out
 
-
 def rotate_label(deg: int, flip_ud: bool = False) -> str:
     rd, fu = normalize_orient(deg, flip_ud)
     if rd == 0:
@@ -575,113 +442,32 @@ def rotate_label(deg: int, flip_ud: bool = False) -> str:
         base = f"rotate={rd}"
     return f"{base} flip={'ON' if fu else 'off'}"
 
-
 def draw_camera_hud(
     img: np.ndarray,
     which_cam: str,
-    rotate_deg: int,
     show_north: bool = True,
     flip_ud: bool = False,
 ) -> None:
     """L/R badge; optional N at TOP (sky) when aligning / checking orient."""
-    col = COL_POST if which_cam == "L" else COL_CLICK_NEAR
+    col = COL_POST if which_cam == "L" else COL_BAR
     put_label(img, "L" if which_cam == "L" else "R", (8, 26), col, 0.75, 2)
     h, w = img.shape[:2]
-    if show_north:
-        cx = w // 2
-        cv2.arrowedLine(img, (cx, 36), (cx, 10), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
-        put_label(img, "N", (cx - 10, 58), (0, 255, 255), 0.7, 2)
-        put_label(img, "up/sky", (cx - 28, 76), (180, 255, 255), 0.4, 1)
-    if show_north:
-        put_label(
-            img,
-            f"flip={'ON' if flip_ud else 'off'}",
-            (8, h - 14),
-            (0, 0, 255) if h < w else (0, 200, 255),
-            0.45,
-            2,
-        )
-
-
-def load_still(path: Path) -> np.ndarray:
-    """Read a still; imdecode handles Windows paths that cv2.imread can miss."""
-    img: np.ndarray | None = None
-    try:
-        data = np.fromfile(str(path), dtype=np.uint8)
-        if data.size:
-            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    except OSError:
-        img = None
-    if img is None:
-        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if img is None or img.size == 0:
-        raise RuntimeError(f"Could not read image: {path}")
-    h, w = img.shape[:2]
-    print(f"  {path.name} — {w}×{h}  still")
-    return img
-
-
-def open_video(path: Path) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        cap.release()
-        raise RuntimeError(f"Could not read frames from: {path}")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    h, w = frame.shape[:2]
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    print(f"  {path.name} — {w}×{h}  {n} frames  {fps:.1f} fps")
-    return cap
-
-
-def video_frame_count(cap: cv2.VideoCapture) -> int:
-    return max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
-
-
-def video_fps(cap: cv2.VideoCapture) -> float:
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    return fps if fps > 1.0 else 30.0
-
-
-def seek_videos(
-    cap_l: cv2.VideoCapture,
-    cap_r: cv2.VideoCapture,
-    frame_idx: int,
-    n_frames: int,
-) -> int:
-    """Seek both files to the same frame so they stay paired."""
-    if n_frames <= 0:
-        return 0
-    idx = int(max(0, min(frame_idx, n_frames - 1)))
-    cap_l.set(cv2.CAP_PROP_POS_FRAMES, idx)
-    cap_r.set(cv2.CAP_PROP_POS_FRAMES, idx)
-    return idx
-
+    if not show_north:
+        return
+    cx = w // 2
+    cv2.arrowedLine(img, (cx, 36), (cx, 10), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
+    put_label(img, "N", (cx - 10, 58), (0, 255, 255), 0.7, 2)
+    put_label(img, "up/sky", (cx - 28, 76), (180, 255, 255), 0.4, 1)
+    put_label(
+        img,
+        f"flip={'ON' if flip_ud else 'off'}",
+        (8, h - 14),
+        (0, 0, 255) if h < w else (0, 200, 255),
+        0.45,
+        2,
+    )
 
 # ─── Goal plane geometry ─────────────────────────────────────────────────────
-
-def goal_corners(
-    baseline_m: float,
-    extend_up_m: float,
-    below_m: float = 0.0,
-) -> dict[str, np.ndarray]:
-    """
-    World points on the goal plane (Z = 0).
-    Y = 0 at camera / crossbar height; positive Y is upward (above the bar).
-    """
-    half = baseline_m / 2.0
-    return {
-        "left_base": np.array([-half, -below_m, 0.0]),
-        "right_base": np.array([half, -below_m, 0.0]),
-        "left_top": np.array([-half, extend_up_m, 0.0]),
-        "right_top": np.array([half, extend_up_m, 0.0]),
-        "bar_left": np.array([-half, 0.0, 0.0]),
-        "bar_right": np.array([half, 0.0, 0.0]),
-    }
-
 
 def apply_affine(
     uv: tuple[float, float],
@@ -694,7 +480,6 @@ def apply_affine(
         float(affine[0, 0] * x + affine[0, 1] * y + affine[0, 2]),
         float(affine[1, 0] * x + affine[1, 1] * y + affine[1, 2]),
     )
-
 
 def project_safe(
     P: np.ndarray,
@@ -715,7 +500,6 @@ def project_safe(
     if not (math.isfinite(u) and math.isfinite(v)) or abs(u) > 1e5 or abs(v) > 1e5:
         return None
     return int(round(u)), int(round(v))
-
 
 def draw_line_world(
     img: np.ndarray,
@@ -738,7 +522,6 @@ def draw_line_world(
     for i in range(len(pts) - 1):
         cv2.line(img, pts[i], pts[i + 1], color, thickness, cv2.LINE_AA)
 
-
 def draw_goal_plane(
     img: np.ndarray,
     P: np.ndarray,
@@ -749,12 +532,12 @@ def draw_goal_plane(
     which_cam: str,
     grid_nx: int = 6,
     grid_ny: int = 8,
-    show_point_labels: bool = True,
     y_vis_min: float = 0.0,
     affine: np.ndarray | None = None,
     compact: bool = False,
 ) -> None:
     """Draw posts, orange crossbar at Y=0, and grid. Optional 2D snap affine."""
+    _ = (pos_l, pos_r, which_cam)  # kept for call-site compatibility
     half = baseline_m / 2.0
     y1 = max(0.4, float(extend_up_m))
     if compact:
@@ -799,27 +582,11 @@ def draw_goal_plane(
     if uv is not None and y_note > 0.05:
         put_label(img, f"FOV from {y_note:.2f}m above bar", (uv[0] + 6, uv[1] + 16), COL_DEBUG, 0.4, 1)
 
-    if not show_point_labels:
-        return
-
-    far_name = "R" if which_cam == "L" else "L"
-    far_x = half if far_name == "R" else -half
-    landmarks: list[tuple[str, np.ndarray]] = [
-        ("bar", np.array([0.0, 0.0, 0.0])),
-        (f"{far_name}-bar", np.array([far_x, 0.0, 0.0])),
-        (f"{far_name}-mid", np.array([far_x, y1 * 0.5, 0.0])),
-        (f"{far_name}-top", np.array([far_x, y1, 0.0])),
-    ]
-    for name, xyz in landmarks:
-        label_world_point(img, P, xyz, pos_l, pos_r, name, which_cam, affine)
-
-
 def fit_height(img: np.ndarray, target_h: int) -> np.ndarray:
     if target_h <= 0 or img.shape[0] == target_h:
         return img
     scale = target_h / img.shape[0]
     return cv2.resize(img, (max(1, int(img.shape[1] * scale)), target_h), interpolation=cv2.INTER_AREA)
-
 
 def side_by_side_full(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, int]:
     """Stack both views at a common height. Uniform scale, no crop."""
@@ -827,7 +594,6 @@ def side_by_side_full(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, 
     fl = fit_height(left, h)
     fr = fit_height(right, h)
     return np.hstack([fl, fr]), fl.shape[1]
-
 
 def attach_status_bar(
     img: np.ndarray,
@@ -845,17 +611,6 @@ def attach_status_bar(
             cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA,
         )
     return np.vstack([img, bar]), bar_h
-
-
-def window_client_size() -> tuple[int, int] | None:
-    try:
-        rect = cv2.getWindowImageRect(WINDOW)
-        if rect is not None and len(rect) >= 4 and int(rect[2]) > 16 and int(rect[3]) > 16:
-            return int(rect[2]), int(rect[3])
-    except cv2.error:
-        pass
-    return None
-
 
 def letterbox(img: np.ndarray, win_w: int, win_h: int) -> tuple[np.ndarray, int, int, int, int]:
     """
@@ -879,125 +634,59 @@ def letterbox(img: np.ndarray, win_w: int, win_h: int) -> tuple[np.ndarray, int,
     canvas[y0:y0 + nh, x0:x0 + nw] = resized
     return canvas, x0, y0, nw, nh
 
-
 # ─── Click state ─────────────────────────────────────────────────────────────
 
 class ClickState:
     def __init__(self) -> None:
-        self.mode = "far"  # "far" | "near"
         self.far_l: list[tuple[int, int]] = []
         self.far_r: list[tuple[int, int]] = []
-        self.near_l: list[tuple[int, int]] = []
-        self.near_r: list[tuple[int, int]] = []
 
     def add(self, side: str, xy: tuple[int, int]) -> int:
-        bucket = {
-            ("far", "L"): self.far_l,
-            ("far", "R"): self.far_r,
-            ("near", "L"): self.near_l,
-            ("near", "R"): self.near_r,
-        }[(self.mode, side)]
+        bucket = self.far_l if side == "L" else self.far_r
         bucket.append(xy)
-        if self.mode == "far" and len(bucket) > 2:
+        if len(bucket) > 2:
             del bucket[:-2]
-        if self.mode == "far":
-            tag = "BOTTOM of post" if len(bucket) == 1 else "TOP of post"
-            extra = "  → now click the TOP of the same post" if len(bucket) == 1 else "  → snapping yellow post"
-            print(f"  {side} {tag}: {xy}{extra}")
-        else:
-            print(f"  Marked {self.mode.upper()} post on {side}: {xy}  (n={len(bucket)})")
+        tag = "BOTTOM of post" if len(bucket) == 1 else "TOP of post"
+        extra = (
+            "  → now click the TOP of the same post"
+            if len(bucket) == 1
+            else "  → snapping yellow post"
+        )
+        print(f"  {side} {tag}: {xy}{extra}")
         return len(bucket)
 
     def clear(self) -> None:
         self.far_l.clear()
         self.far_r.clear()
-        self.near_l.clear()
-        self.near_r.clear()
         print("  Cleared all click marks")
 
-    def draw_on(
-        self,
-        img_l: np.ndarray,
-        img_r: np.ndarray,
-        P1: np.ndarray | None = None,
-        P2: np.ndarray | None = None,
-        pos_l: np.ndarray | None = None,
-        pos_r: np.ndarray | None = None,
-    ) -> list[str]:
-        """Draw clicks; if paired L/R exist, triangulate and annotate distances."""
-        debug_lines: list[str] = []
-
-        def _draw(img, pts, color, far: bool):
-            names = ("BOT", "TOP") if far else ("N1", "N2")
+    def draw_on(self, img_l: np.ndarray, img_r: np.ndarray) -> None:
+        def _draw(img, pts):
             for i, (x, y) in enumerate(pts):
-                cv2.circle(img, (x, y), 7, color, -1, cv2.LINE_AA)
-                put_label(img, names[i] if i < 2 else f"{i+1}", (x + 8, y - 8), color, 0.5, 1)
+                name = ("BOT", "TOP")[i] if i < 2 else f"{i+1}"
+                cv2.circle(img, (x, y), 7, COL_CLICK_FAR, -1, cv2.LINE_AA)
+                put_label(img, name, (x + 8, y - 8), COL_CLICK_FAR, 0.5, 1)
             if len(pts) >= 2:
-                cv2.line(img, pts[0], pts[1], color, 2, cv2.LINE_AA)
+                cv2.line(img, pts[0], pts[1], COL_CLICK_FAR, 2, cv2.LINE_AA)
                 cv2.arrowedLine(
-                    img, pts[0], pts[1], color, 2, cv2.LINE_AA, tipLength=0.12,
+                    img, pts[0], pts[1], COL_CLICK_FAR, 2, cv2.LINE_AA, tipLength=0.12,
                 )
 
-        _draw(img_l, self.far_l, COL_CLICK_FAR, True)
-        _draw(img_r, self.far_r, COL_CLICK_FAR, True)
-        _draw(img_l, self.near_l, COL_CLICK_NEAR, False)
-        _draw(img_r, self.near_r, COL_CLICK_NEAR, False)
-
-        if P1 is None or P2 is None or pos_l is None or pos_r is None:
-            return debug_lines
-
-        def _pair(name: str, pts_l: list, pts_r: list, color):
-            n = min(len(pts_l), len(pts_r))
-            for i in range(n):
-                xyz = triangulate_3d(P1, P2, pts_l[i], pts_r[i])
-                if xyz is None:
-                    debug_lines.append(f"{name}{i+1}: triangulate failed")
-                    continue
-                d_l = dist3(xyz, pos_l)
-                d_r = dist3(xyz, pos_r)
-                elev_l = elevation_from_horizontal(pos_l, xyz)
-                elev_r = elevation_from_horizontal(pos_r, xyz)
-                x, y, z = map(float, xyz)
-                msg = (
-                    f"{name}{i+1}: XYZ=({x:+.2f},{y:+.2f},{z:+.2f})  "
-                    f"dL={d_l:.2f}m dR={d_r:.2f}m  elevL={elev_l:.0f}° elevR={elev_r:.0f}°"
-                )
-                debug_lines.append(msg)
-                for img, P, pt in ((img_l, P1, pts_l[i]), (img_r, P2, pts_r[i])):
-                    put_label(
-                        img,
-                        f"dL={d_l:.2f} dR={d_r:.2f} Y={y:.2f}",
-                        (pt[0] + 8, pt[1] + 16),
-                        color,
-                        0.4,
-                        1,
-                    )
-
-        _pair("Far", self.far_l, self.far_r, COL_CLICK_FAR)
-        _pair("Near", self.near_l, self.near_r, COL_CLICK_NEAR)
-        return debug_lines
+        _draw(img_l, self.far_l)
+        _draw(img_r, self.far_r)
 
     def to_dict(self) -> dict:
-        return {
-            "far_left": self.far_l,
-            "far_right": self.far_r,
-            "near_left": self.near_l,
-            "near_right": self.near_r,
-        }
+        return {"far_left": self.far_l, "far_right": self.far_r}
 
     def load_dict(self, data: dict) -> None:
         self.far_l = [(int(p[0]), int(p[1])) for p in data.get("far_left", [])]
         self.far_r = [(int(p[0]), int(p[1])) for p in data.get("far_right", [])]
-        self.near_l = [(int(p[0]), int(p[1])) for p in data.get("near_left", [])]
-        self.near_r = [(int(p[0]), int(p[1])) for p in data.get("near_right", [])]
-
 
 # ─── Ball (YOLO + triangulation vs the Z=0 plane) ────────────────────────────
 
 def default_ball_model() -> str:
     custom = PROJECT_ROOT / "models" / "football_yolov8n.pt"
     return str(custom) if custom.exists() else COCO_MODEL
-
 
 def load_ball_model(model_str: str) -> tuple[YOLO, list[int] | None]:
     path = Path(model_str)
@@ -1013,7 +702,6 @@ def load_ball_model(model_str: str) -> tuple[YOLO, list[int] | None]:
     except Exception:
         pass
     return model, ([SPORTS_BALL_CLASS] if is_coco else None)
-
 
 def detect_both(
     model: YOLO,
@@ -1048,7 +736,6 @@ def detect_both(
 
     return best(results[0]), best(results[1])
 
-
 class BallDetectScheduler:
     """
     Motion-gated YOLO with adaptive stride (keeps YOLO rare).
@@ -1072,33 +759,24 @@ class BallDetectScheduler:
         self.stale_frames = max(1, int(stale_frames))
         self.frame_i = 0
         self.since_yolo = 10**9
-        self.last_dets: tuple = (None, None)
         self.last_xyz: np.ndarray | None = None
-        self.prev_xyz: np.ndarray | None = None
         self.last_xyz_t: float | None = None
         self.armed_until = 0
         self.last_mode = "idle"
-        self.yolo_runs = 0
         self._last_speed = 0.0
 
     def reset(self) -> None:
         self.frame_i = 0
         self.since_yolo = 10**9
-        self.last_dets = (None, None)
         self.last_xyz = None
-        self.prev_xyz = None
         self.last_xyz_t = None
         self.armed_until = 0
         self.last_mode = "idle"
-        self.yolo_runs = 0
         self._last_speed = 0.0
 
-    def should_run(self, has_motion: bool, now: float, force: bool = False) -> tuple[bool, str]:
+    def should_run(self, has_motion: bool, _now: float = 0.0) -> tuple[bool, str]:
         self.frame_i += 1
         self.since_yolo += 1
-        if force:
-            self.last_mode = "force"
-            return True, self.last_mode
 
         was_idle = self.frame_i > self.armed_until
         if has_motion:
@@ -1130,37 +808,24 @@ class BallDetectScheduler:
         self.last_mode = "idle"
         return False, self.last_mode
 
-    def note_yolo(self, dets: tuple, now: float) -> None:
-        self.last_dets = dets
+    def note_yolo(self, _dets: tuple, _now: float) -> None:
         self.since_yolo = 0
-        self.yolo_runs += 1
 
     def note_track(self, xyz: np.ndarray | None, now: float) -> None:
         if xyz is None:
             if self.since_yolo >= self.stale_frames:
                 self.last_xyz = None
-                self.prev_xyz = None
                 self.last_xyz_t = None
                 self._last_speed = 0.0
             return
         if self.last_xyz is not None and self.last_xyz_t is not None:
             dt = max(now - self.last_xyz_t, 1e-3)
             self._last_speed = float(np.linalg.norm(xyz - self.last_xyz) / dt)
-            self.prev_xyz = self.last_xyz.copy()
         else:
             self._last_speed = 0.0
         self.last_xyz = np.asarray(xyz, dtype=np.float64).reshape(3).copy()
         self.last_xyz_t = now
         self.armed_until = max(self.armed_until, self.frame_i + ARM_AFTER_MOTION)
-
-    def held_dets(self) -> tuple:
-        if self.since_yolo > self.stale_frames:
-            return (None, None)
-        return self.last_dets
-
-    def status(self) -> str:
-        return f"yolo={self.last_mode} runs={self.yolo_runs}"
-
 
 def estimate_ball_xyz(
     det_l,
@@ -1182,14 +847,12 @@ def estimate_ball_xyz(
         return None
     return xyz
 
-
 def plane_side_label(z: float, eps: float = PLANE_CROSS_M) -> str:
     if z > eps:
         return "field"
     if z < -eps:
         return "through"
     return "on-plane"
-
 
 def overlay_snap_to_clicks(
     P: np.ndarray,
@@ -1258,18 +921,15 @@ def overlay_snap_to_clicks(
     deg = math.degrees(ang)
     return affine, moved, f"shift {shift[0]:+.0f},{shift[1]:+.0f}px  rot {deg:+.1f}°"
 
-
 def reproj_err_px(P: np.ndarray, xyz: np.ndarray, uv: tuple[float, float]) -> float:
     pred = project_world(P, xyz)
     if pred is None:
         return 1e9
     return math.hypot(pred[0] - uv[0], pred[1] - uv[1])
 
-
 def inside_posts(x: float, baseline: float, radius: float = 0.0) -> bool:
     """True only if the whole ball (centre ± radius) sits between the posts."""
     return abs(x) + radius <= baseline / 2.0 + POST_MARGIN_M
-
 
 def live_ball_call(
     x: float,
@@ -1287,7 +947,6 @@ def live_ball_call(
     if in_posts:
         return "goal"
     return "wide"
-
 
 def update_call_latch(
     call: str,
@@ -1326,7 +985,6 @@ def update_call_latch(
         return latch
     return call
 
-
 def call_style(call: str) -> tuple[tuple[int, int, int], str, bool]:
     """colour, short label, pulse. Empty label = do not highlight."""
     if call == "approaching":
@@ -1339,7 +997,6 @@ def call_style(call: str) -> tuple[tuple[int, int, int], str, bool]:
         return COL_CALL_RED, "WIDE", False
     return (80, 80, 80), "", False
 
-
 def draw_flash_border(img: np.ndarray, color: tuple[int, int, int], now: float, pulse: bool) -> None:
     h, w = img.shape[:2]
     if h < 8 or w < 8:
@@ -1351,7 +1008,6 @@ def draw_flash_border(img: np.ndarray, color: tuple[int, int, int], now: float, 
     thick = max(4, min(thick, min(h, w) // 8))
     cv2.rectangle(img, (2, 2), (w - 3, h - 3), color, thick)
 
-
 def paint_ball_box(img: np.ndarray, det, color: tuple[int, int, int], label: str) -> None:
     if det is None:
         return
@@ -1360,7 +1016,6 @@ def paint_ball_box(img: np.ndarray, det, color: tuple[int, int, int], label: str
     cv2.circle(img, (int(det[0]), int(det[1])), 5, color, -1)
     if label:
         put_label(img, label, (x1, max(20, y1 - 8)), color, 0.48, 2)
-
 
 def paint_ball_pair(
     disp_l: np.ndarray,
@@ -1411,23 +1066,29 @@ def paint_ball_pair(
         ), "reject"
 
     radius = cfg.BALL_RADIUS_M
+    d_l = dist3(pos3d, pos_l)
+    d_r = dist3(pos3d, pos_r)
     raw = live_ball_call(x, z, baseline, radius)
     call = update_call_latch(raw, z, now, latch_state)
     color, banner, pulse = call_style(call)
+    # Per-camera stereo range to the ball (metres).
+    label_l = f"{banner}  {d_l:.2f}m" if banner else f"{d_l:.2f}m"
+    label_r = f"{banner}  {d_r:.2f}m" if banner else f"{d_r:.2f}m"
     if banner:
-        paint_ball_box(disp_l, det_l, color, banner)
-        paint_ball_box(disp_r, det_r, color, banner)
+        paint_ball_box(disp_l, det_l, color, label_l)
+        paint_ball_box(disp_r, det_r, color, label_r)
         draw_flash_border(disp_l, color, now, pulse)
         draw_flash_border(disp_r, color, now, pulse)
     else:
-        paint_ball_box(disp_l, det_l, COL_BALL, "")
-        paint_ball_box(disp_r, det_r, COL_BALL, "")
+        paint_ball_box(disp_l, det_l, COL_BALL, label_l)
+        paint_ball_box(disp_r, det_r, COL_BALL, label_r)
 
     half = baseline / 2.0
     in_posts = inside_posts(x, baseline, radius)
     x0, x1 = x - radius, x + radius
     line = (
-        f"dbg  X={x:+.2f} ball[{x0:+.2f},{x1:+.2f}] posts±{half:.2f} "
+        f"dbg  dL={d_l:.2f}m dR={d_r:.2f}m  "
+        f"X={x:+.2f} ball[{x0:+.2f},{x1:+.2f}] posts±{half:.2f} "
         f"{'IN' if in_posts else 'OUT'}  "
         f"Y={y:+.2f}  Z={z:+.2f} ({plane_side_label(z)})  "
         f"reproj {err_l:.0f}/{err_r:.0f}px"
@@ -1435,20 +1096,28 @@ def paint_ball_pair(
     )
     return line, call
 
-
 def compact_ball_status(ball_line: str, ball_call: str, yolo_mode: str = "") -> str:
     """One short status line for the live HUD."""
     _, banner, _ = call_style(ball_call)
+    dbit = ""
+    if "dL=" in ball_line and "dR=" in ball_line:
+        try:
+            dl = ball_line.split("dL=")[1].split()[0]
+            dr = ball_line.split("dR=")[1].split()[0]
+            dbit = f"dL {dl}  dR {dr}"
+        except (IndexError, ValueError):
+            dbit = ""
     if banner:
-        core = banner
+        core = f"{banner}  {dbit}".strip() if dbit else banner
     elif "need both" in ball_line:
         core = "1-cam"
     elif "ignore" in ball_line or "mismatch" in ball_line:
         core = "reject"
     elif "3D failed" in ball_line:
         core = "no-3D"
+    elif dbit:
+        core = dbit
     elif ball_line.startswith("dbg"):
-        # Pull Z if present
         zbit = ""
         if "Z=" in ball_line:
             try:
@@ -1461,7 +1130,6 @@ def compact_ball_status(ball_line: str, ball_call: str, yolo_mode: str = "") -> 
         core = "—"
     mode = f" · {yolo_mode}" if yolo_mode else ""
     return f"{core}{mode}"
-
 
 # ─── Save / load ─────────────────────────────────────────────────────────────
 
@@ -1521,8 +1189,6 @@ def save_plane(
     }
     PLANE_PATH.write_text(json.dumps(payload, indent=2))
     print(f"Saved → {PLANE_PATH}")
-    print(json.dumps(payload, indent=2))
-
 
 def load_plane() -> dict | None:
     if not PLANE_PATH.exists():
@@ -1532,648 +1198,13 @@ def load_plane() -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
 
-
-# ─── Main ────────────────────────────────────────────────────────────────────
-
-def _require_both(left, right, name: str) -> bool | None:
-    """True if both set, False if neither, None if only one (invalid)."""
-    if left and right:
-        return True
-    if left or right:
-        print(f"ERROR: provide BOTH --{name}-left and --{name}-right.", file=sys.stderr)
-        return None
-    return False
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Goal-plane overlay / click calibration test")
-    parser.add_argument("--left", type=int, default=0)
-    parser.add_argument("--right", type=int, default=1)
-    parser.add_argument(
-        "--video-left", type=str, default=None,
-        help="Left-camera video (use with --video-right instead of live cameras)",
-    )
-    parser.add_argument(
-        "--video-right", type=str, default=None,
-        help="Right-camera video (use with --video-left instead of live cameras)",
-    )
-    parser.add_argument(
-        "--image-left", type=str, default=None,
-        help="Left-camera still (jpg/png/…). Use with --image-right",
-    )
-    parser.add_argument(
-        "--image-right", type=str, default=None,
-        help="Right-camera still (jpg/png/…). Use with --image-left",
-    )
-    parser.add_argument("--baseline", type=float, default=cfg.BASELINE_M)
-    parser.add_argument(
-        "--behind", type=float, default=cfg.CAM_BEHIND_POST_M,
-        help="Lens centre behind the field-side post face (metres)",
-    )
-    parser.add_argument("--h-angle", type=float, default=cfg.H_ANGLE_DEG)
-    parser.add_argument("--v-angle", type=float, default=cfg.V_ANGLE_DEG)
-    parser.add_argument("--extend", type=float, default=4.0,
-                        help="How far above the bar to draw the plane (metres)")
-    parser.add_argument("--focal", type=float, default=None)
-    parser.add_argument(
-        "--rotate", type=int, default=None, choices=(0, 90, 270),
-        help="Rotate landscape frames: 90=CW, 270=CCW, 0=off "
-             f"(default {cfg.SIDEWAYS_ROTATE_DEG} from stereo_config)",
-    )
-    flip_grp = parser.add_mutually_exclusive_group()
-    flip_grp.add_argument(
-        "--flip", dest="flip", action="store_true",
-        help="Force upside-down flip ON",
-    )
-    flip_grp.add_argument(
-        "--no-flip", dest="flip", action="store_false",
-        help="Force upside-down flip OFF",
-    )
-    parser.set_defaults(flip=None)
-    parser.add_argument(
-        "--model", type=str, default=None,
-        help="Ball detector. Default: models/football_yolov8n.pt if present, else yolov8n.pt",
-    )
-    parser.add_argument("--conf", type=float, default=CONFIDENCE)
-    parser.add_argument(
-        "--imgsz", type=int, default=IMAGE_SIZE,
-        help=f"YOLO inference size (default {IMAGE_SIZE}; lower = faster)",
-    )
-    parser.add_argument(
-        "--yolo-stride", type=int, default=IDLE_YOLO_STRIDE,
-        help=f"When ball is deep in field, run YOLO every N frames (default {IDLE_YOLO_STRIDE})",
-    )
-    parser.add_argument(
-        "--device", type=str, default=YOLO_DEVICE,
-        help="YOLO device (cpu or 0)",
-    )
-    parser.add_argument("--no-ball", action="store_true", help="Start with ball detection off (B toggles)")
-    parser.add_argument(
-        "--no-motion-gate", action="store_true",
-        help="Always consider the scene 'moving' (YOLO scheduling only by near/fast/stride)",
-    )
-    parser.add_argument("--list", action="store_true")
-    args = parser.parse_args()
-
-    if args.list:
-        print("Probing cameras 0–5:")
-        for i in range(6):
-            try:
-                cap = open_camera(i)
-                print(f"  → {i} OK")
-                cap.release()
-                time.sleep(0.3)
-            except RuntimeError as e:
-                print(f"  → {i} FAIL: {e}")
-        return 0
-
-    if (args.video_left or args.video_right) and (args.image_left or args.image_right):
-        print("ERROR: use either --video-* or --image-*, not both.", file=sys.stderr)
-        return 1
-    want_video = _require_both(args.video_left, args.video_right, "video")
-    want_image = _require_both(args.image_left, args.image_right, "image")
-    if want_video is None or want_image is None:
-        return 1
-    if not want_video and not want_image and args.left == args.right:
-        print("ERROR: --left and --right must differ", file=sys.stderr)
-        return 1
-
-    source = "live"
-    if want_image:
-        source = "still"
-    elif want_video:
-        source = "video"
-
-    h_angle = float(args.h_angle)
-    h_left = float(h_angle)
-    h_right = -float(h_angle)
-    v_angle = float(args.v_angle)
-    extend_up = float(args.extend)
-    baseline = float(args.baseline)
-    behind = float(args.behind)
-    if baseline <= 0:
-        print("ERROR: --baseline must be > 0", file=sys.stderr)
-        return 1
-    if behind < 0:
-        print("ERROR: --behind must be >= 0", file=sys.stderr)
-        return 1
-    rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
-    flip_ud = bool(args.flip) if args.flip is not None else bool(cfg.FLIP_UD)
-    rotate_deg, flip_ud = normalize_orient(rotate_deg, flip_ud)
-    clicks = ClickState()
-    snap_l: np.ndarray | None = None
-    snap_r: np.ndarray | None = None
-    ball_on = not bool(args.no_ball)
-    show_labels = False
-    paused = source != "live"
-    model: YOLO | None = None
-    ball_classes: list[int] | None = None
-    ball_dets: tuple = (None, None)
-    ball_sched = BallDetectScheduler(idle_stride=int(args.yolo_stride))
-    motion_l = SkyMotionDetector(warmup_frames=8)
-    motion_r = SkyMotionDetector(warmup_frames=8)
-    yolo_imgsz = max(160, int(args.imgsz))
-    motion_gate = not bool(args.no_motion_gate)
-    ball_latch: dict = {"prev_z": None, "latch": None, "latch_until": 0.0}
-    panel_split_x = 0
-    frame_i = 0
-    fps_ema = 0.0
-    last_t = time.time()
-    video_n = 0
-    play_fps = 30.0
-    src_l = f"cam {args.left}"
-    src_r = f"cam {args.right}"
-
-    mouse = {"x": 0, "y": 0, "clicked": False}
-
-    def on_mouse(event, x, y, _flags, _param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            mouse["x"] = x
-            mouse["y"] = y
-            mouse["clicked"] = True
-
-    cap_l = cap_r = None
-    frame_l: np.ndarray | None = None
-    frame_r: np.ndarray | None = None
-    try:
-        if source == "still":
-            path_l = resolve_media_path(args.image_left, "Image")
-            path_r = resolve_media_path(args.image_right, "Image")
-            print(f"\nOpening left still:  {path_l}")
-            frame_l = load_still(path_l)
-            print(f"Opening right still: {path_r}")
-            frame_r = load_still(path_r)
-            src_l, src_r = path_l.name, path_r.name
-            probe_l, probe_r = frame_l, frame_r
-        elif source == "video":
-            path_l = resolve_media_path(args.video_left, "Video")
-            path_r = resolve_media_path(args.video_right, "Video")
-            if is_still_path(path_l) or is_still_path(path_r):
-                if not (is_still_path(path_l) and is_still_path(path_r)):
-                    print(
-                        "ERROR: mix of still and video. Use two images or two videos.",
-                        file=sys.stderr,
-                    )
-                    return 1
-                source = "still"
-                paused = True
-                print(f"\nOpening left still:  {path_l}")
-                frame_l = load_still(path_l)
-                print(f"Opening right still: {path_r}")
-                frame_r = load_still(path_r)
-                src_l, src_r = path_l.name, path_r.name
-                probe_l, probe_r = frame_l, frame_r
-            else:
-                print(f"\nOpening left video:  {path_l}")
-                cap_l = open_video(path_l)
-                print(f"Opening right video: {path_r}")
-                cap_r = open_video(path_r)
-                src_l, src_r = path_l.name, path_r.name
-                video_n = min(video_frame_count(cap_l), video_frame_count(cap_r))
-                play_fps = min(video_fps(cap_l), video_fps(cap_r))
-                ok_l, probe_l = read_cam(cap_l)
-                ok_r, probe_r = read_cam(cap_r)
-                if not ok_l or probe_l is None or not ok_r or probe_r is None:
-                    print("ERROR: could not read initial video frames.", file=sys.stderr)
-                    return 1
-                seek_videos(cap_l, cap_r, 0, video_n)
-                paused = False
-        else:
-            print(f"\nOpening left camera ({args.left})...")
-            cap_l = open_camera(args.left)
-            time.sleep(0.5)
-            print(f"Opening right camera ({args.right})...")
-            cap_r = open_camera(args.right)
-            ok_l, probe_l = read_cam(cap_l)
-            ok_r, probe_r = read_cam(cap_r)
-            if not ok_l or probe_l is None or not ok_r or probe_r is None:
-                print("ERROR: could not read initial frames.", file=sys.stderr)
-                return 1
-
-        view_probe_l = orient_frame(probe_l, rotate_deg, flip_ud=flip_ud)
-        view_probe_r = orient_frame(probe_r, rotate_deg, flip_ud=flip_ud)
-        img_w, img_h = view_probe_l.shape[1], view_probe_l.shape[0]
-        img_w_r, img_h_r = view_probe_r.shape[1], view_probe_r.shape[0]
-        raw_l_wh = (probe_l.shape[1], probe_l.shape[0])
-        raw_r_wh = (probe_r.shape[1], probe_r.shape[0])
-        print(f"  Orient: {rotate_label(rotate_deg, flip_ud)}")
-        if raw_l_wh != (img_w, img_h) or raw_r_wh != (img_w_r, img_h_r):
-            print(
-                f"  Landscape → portrait: "
-                f"L {raw_l_wh[0]}×{raw_l_wh[1]}→{img_w}×{img_h}  "
-                f"R {raw_r_wh[0]}×{raw_r_wh[1]}→{img_w_r}×{img_h_r}"
-            )
-        elif rotate_deg and cfg.CAMERAS_SIDEWAYS:
-            print("  Frames already portrait — sideways rotate skipped (O/U still work)")
-        if (img_w, img_h) != (img_w_r, img_h_r):
-            print(
-                f"WARNING: left is {img_w}×{img_h}, right is {img_w_r}×{img_h_r}. "
-                "Projection uses each view's own size."
-            )
-        if args.focal is not None:
-            focal_px, focal_src = float(args.focal), "CLI"
-            focal_r = focal_px * (img_w_r / img_w) if img_w else focal_px
-        else:
-            focal_px, focal_src = cfg.get_focal_px(img_w)
-            focal_r, _ = cfg.get_focal_px(img_w_r)
-
-        cfg.print_summary(focal_px, focal_src, behind_m=behind)
-        extra = ""
-        if source == "video":
-            extra = (
-                f"Video replay: {src_l} | {src_r}  ({video_n} frames @ {play_fps:.1f} fps)\n"
-                "SPACE pause  A/D seek  (files loop and stay in sync)\n"
-            )
-        elif source == "still":
-            extra = f"Still pair: {src_l} | {src_r}\n"
-        print(
-            f"Posts {baseline:.2f} m apart.  L/R = behind the goal, facing the field.\n"
-            f"{extra}"
-            "Blue = in field (whole ball between posts).  Green = through + between.  "
-            "Red = through but wide.  Need both cameras.\n"
-            "Click BOTTOM then TOP of the far post — overlay slides with the yellow line.\n"
-            f"Ball YOLO: motion-wake (same frame), near-plane every frame, "
-            f"else every {ball_sched.idle_stride} · imgsz={yolo_imgsz}"
-            f"{'' if motion_gate else ' · motion-gate OFF'}.\n"
-        )
-
-        xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
-        pos_l = np.array(xyz_l)
-        pos_r = np.array(xyz_r)
-        post_l = np.array([-baseline / 2.0, 0.0, 0.0])
-        post_r = np.array([baseline / 2.0, 0.0, 0.0])
-
-        def build_projs():
-            P1 = make_proj_matrix(pos_l, h_left, v_angle, focal_px, img_w, img_h)
-            P2 = make_proj_matrix(pos_r, h_right, v_angle, focal_r, img_w_r, img_h_r)
-            return P1, P2
-
-        P1, P2 = build_projs()
-
-        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW, 1600, 900)
-        cv2.setMouseCallback(WINDOW, on_mouse)
-        layout = {
-            "x0": 0, "y0": 0, "nw": 1, "nh": 1,
-            "src_w": 1, "src_h": 1, "split_x": 0, "bar_h": 0, "pair_h": 1,
-        }
-
-        while True:
-            if source != "still" and (not paused or frame_l is None or frame_r is None):
-                assert cap_l is not None and cap_r is not None
-                ok_l, next_l = read_cam(cap_l)
-                ok_r, next_r = read_cam(cap_r)
-                if source == "video" and (not ok_l or next_l is None or not ok_r or next_r is None):
-                    seek_videos(cap_l, cap_r, 0, video_n)
-                    ok_l, next_l = read_cam(cap_l)
-                    ok_r, next_r = read_cam(cap_r)
-                    ball_dets = (None, None)
-                    ball_sched.reset()
-                    motion_l.reset()
-                    motion_r.reset()
-                if not ok_l or next_l is None or not ok_r or next_r is None:
-                    time.sleep(0.02)
-                    continue
-                frame_l, frame_r = next_l, next_r
-                if source == "live" or not paused:
-                    # New frame pair — scheduler decides whether to re-run YOLO
-                    pass
-
-            if frame_l is None or frame_r is None:
-                time.sleep(0.02)
-                continue
-
-            view_l = orient_frame(frame_l, rotate_deg, flip_ud=flip_ud)
-            view_r = orient_frame(frame_r, rotate_deg, flip_ud=flip_ud)
-            img_w, img_h = view_l.shape[1], view_l.shape[0]
-            img_w_r, img_h_r = view_r.shape[1], view_r.shape[0]
-            if args.focal is not None:
-                focal_px = float(args.focal)
-                focal_r = focal_px * (img_w_r / img_w) if img_w else focal_px
-            else:
-                focal_px, _ = cfg.get_focal_px(img_w)
-                focal_r, _ = cfg.get_focal_px(img_w_r)
-
-            # Rebuild projection if angles / size / rotate changed
-            P1, P2 = build_projs()
-
-            now = time.time()
-            dt = max(now - last_t, 1e-6)
-            last_t = now
-            fps_ema = (1.0 / dt) if frame_i == 0 else (0.9 * fps_ema + 0.1 / dt)
-            frame_i += 1
-
-            disp_l = view_l.copy()
-            disp_r = view_r.copy()
-            _, y_vis, _ = cfg.lowest_visible_on_far_post(baseline, behind, v_angle)
-            y_vis = max(0.0, float(y_vis))
-            draw_goal_plane(
-                disp_l, P1, baseline, extend_up, pos_l, pos_r, "L",
-                show_point_labels=show_labels, y_vis_min=y_vis, affine=snap_l,
-            )
-            draw_goal_plane(
-                disp_r, P2, baseline, extend_up, pos_l, pos_r, "R",
-                show_point_labels=show_labels, y_vis_min=y_vis, affine=snap_r,
-            )
-            click_dbg = clicks.draw_on(disp_l, disp_r, P1, P2, pos_l, pos_r)
-
-            ball_line = ""
-            ball_call = "none"
-            if ball_on:
-                if model is None:
-                    model, ball_classes = load_ball_model(args.model or default_ball_model())
-                # Still: one YOLO. Video pause: freeze last dets. Live/play: schedule.
-                do_infer = True
-                if source == "still":
-                    do_infer = ball_sched.yolo_runs == 0
-                elif source == "video" and paused:
-                    do_infer = False
-                if do_infer:
-                    mr_l = motion_l.process(view_l)
-                    mr_r = motion_r.process(view_r)
-                    has_motion = (not motion_gate) or bool(mr_l.blobs) or bool(mr_r.blobs)
-                    force = source == "still"
-                    run_yolo, _yolo_mode = ball_sched.should_run(has_motion, now, force=force)
-                    if run_yolo:
-                        ball_dets = detect_both(
-                            model,
-                            view_l,
-                            view_r,
-                            args.conf,
-                            ball_classes,
-                            imgsz=yolo_imgsz,
-                            device=str(args.device),
-                        )
-                        ball_sched.note_yolo(ball_dets, now)
-                        xyz = estimate_ball_xyz(
-                            ball_dets[0], ball_dets[1], P1, P2, pos_l, pos_r,
-                        )
-                        ball_sched.note_track(xyz, now)
-                    else:
-                        ball_dets = ball_sched.held_dets()
-                        if ball_sched.last_mode == "idle":
-                            ball_dets = (None, None)
-                ball_line, ball_call = paint_ball_pair(
-                    disp_l, disp_r, ball_dets[0], ball_dets[1],
-                    P1, P2, pos_l, pos_r, baseline, now, ball_latch,
-                )
-                if ball_line:
-                    ball_line = f"{ball_line}  {ball_sched.status()}"
-                else:
-                    ball_line = f"dbg  {ball_sched.status()}"
-            else:
-                ball_dets = (None, None)
-
-            draw_camera_hud(disp_l, "L", rotate_deg, flip_ud=flip_ud)
-            draw_camera_hud(disp_r, "R", rotate_deg, flip_ud=flip_ud)
-
-            combo, panel_split_x = side_by_side_full(disp_l, disp_r)
-            color, banner, pulse = call_style(ball_call)
-            if banner:
-                draw_flash_border(combo, color, now, pulse)
-            pair_h = combo.shape[0]
-
-            src_note = ""
-            if source == "video" and cap_l is not None:
-                nxt = int(cap_l.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                shown = max(1, nxt)
-                src_note = f"  {shown}/{video_n}"
-            lines = [
-                f"L {src_l}  R {src_r}  |  posts {baseline:.2f}m  "
-                f"ball Ø{cfg.BALL_DIAMETER_M*100:.0f}cm  "
-                f"HL{h_left:.0f} HR{h_right:.0f} V{v_angle:.0f}  visY≥{y_vis:.2f}m  "
-                f"{fps_ema:.0f}fps  {rotate_label(rotate_deg, flip_ud)}{src_note}",
-            ]
-            if ball_line:
-                lines.append(ball_line)
-            lines.extend(click_dbg[:1])
-            packed, bar_h = attach_status_bar(
-                combo, lines,
-                accent_color=color if banner else None,
-                accent_line=ball_line,
-            )
-
-            win = window_client_size() or (1600, 900)
-            canvas, x0, y0, nw, nh = letterbox(packed, win[0], win[1])
-            layout.update({
-                "x0": x0, "y0": y0, "nw": nw, "nh": nh,
-                "src_w": packed.shape[1], "src_h": packed.shape[0],
-                "split_x": panel_split_x, "bar_h": bar_h, "pair_h": pair_h,
-            })
-            cv2.imshow(WINDOW, canvas)
-
-            if mouse["clicked"]:
-                mouse["clicked"] = False
-                mx, my = mouse["x"], mouse["y"]
-                nw, nh = layout["nw"], layout["nh"]
-                if nw > 0 and nh > 0:
-                    x0, y0 = layout["x0"], layout["y0"]
-                    if x0 <= mx < x0 + nw and y0 <= my < y0 + nh:
-                        sx = (mx - x0) * layout["src_w"] / nw
-                        sy = (my - y0) * layout["src_h"] / nh
-                        pair_h = layout["pair_h"]
-                        split_x = layout["split_x"]
-                        if 0 <= sy < pair_h:
-                            if sx < split_x and split_x > 0:
-                                x = max(0, min(view_l.shape[1] - 1, int(sx * view_l.shape[1] / split_x)))
-                                y = max(0, min(view_l.shape[0] - 1, int(sy * view_l.shape[0] / pair_h)))
-                                n = clicks.add("L", (x, y))
-                                if clicks.mode == "far" and n >= 2:
-                                    half = baseline / 2.0
-                                    aff, _moved, note = overlay_snap_to_clicks(
-                                        P1, clicks.far_l, +half, 0.0, extend_up,
-                                    )
-                                    if aff is None:
-                                        print(f"  Left snap skipped — {note}")
-                                    else:
-                                        snap_l = aff
-                                        print(f"  Left overlay moved with yellow post  {note}")
-                            elif layout["src_w"] > split_x:
-                                lx = sx - split_x
-                                rw = layout["src_w"] - split_x
-                                x = max(0, min(view_r.shape[1] - 1, int(lx * view_r.shape[1] / rw)))
-                                y = max(0, min(view_r.shape[0] - 1, int(sy * view_r.shape[0] / pair_h)))
-                                n = clicks.add("R", (x, y))
-                                if clicks.mode == "far" and n >= 2:
-                                    half = baseline / 2.0
-                                    aff, _moved, note = overlay_snap_to_clicks(
-                                        P2, clicks.far_r, -half, 0.0, extend_up,
-                                    )
-                                    if aff is None:
-                                        print(f"  Right snap skipped — {note}")
-                                    else:
-                                        snap_r = aff
-                                        print(f"  Right overlay moved with yellow post  {note}")
-
-            if source == "video":
-                delay = 30 if paused else max(1, int(round(1000.0 / play_fps)))
-            elif source == "still":
-                delay = 30
-            else:
-                delay = 1
-            key = cv2.waitKey(delay) & 0xFF
-            if key in (ord("q"), ord("Q"), 27):
-                break
-            elif source == "video" and key == 32:  # SPACE
-                paused = not paused
-                print(f"  Video {'PAUSED' if paused else 'PLAY'}")
-            elif source == "video" and cap_l is not None and cap_r is not None and key in (
-                ord("a"), ord("A"), ord("d"), ord("D"),
-            ):
-                step = max(1, int(round(play_fps)))
-                nxt = int(cap_l.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                current = max(0, nxt - 1)
-                target = current - step if key in (ord("a"), ord("A")) else current + step
-                seek_videos(cap_l, cap_r, target, video_n)
-                frame_l = frame_r = None
-                ball_dets = (None, None)
-                ball_sched.reset()
-                motion_l.reset()
-                motion_r.reset()
-                print(f"  Seek → frame {max(0, min(target, max(video_n - 1, 0)))}/{video_n}")
-            elif key in (ord("f"), ord("F")):
-                clicks.mode = "far"
-                print("Click mode: FAR post")
-            elif key in (ord("n"), ord("N")):
-                clicks.mode = "near"
-                print("Click mode: NEAR post")
-            elif key in (ord("c"), ord("C")):
-                clicks.clear()
-            elif key == ord("["):
-                h_left = max(1.0, h_left - 1.0)
-                h_right = min(-1.0, h_right + 1.0)
-                snap_l = snap_r = None
-                print(f"  H → L {h_left:.1f}°  R {h_right:.1f}°  (overlay snap cleared)")
-            elif key == ord("]"):
-                h_left = min(120.0, h_left + 1.0)
-                h_right = max(-120.0, h_right - 1.0)
-                snap_l = snap_r = None
-                print(f"  H → L {h_left:.1f}°  R {h_right:.1f}°  (overlay snap cleared)")
-            elif key == ord("-"):
-                v_angle = max(0.0, v_angle - 1.0)
-                snap_l = snap_r = None
-                print(f"  V_ANGLE → {v_angle:.1f}°  (overlay snap cleared)")
-            elif key == ord("="):
-                v_angle = min(89.0, v_angle + 1.0)
-                snap_l = snap_r = None
-                print(f"  V_ANGLE → {v_angle:.1f}°  (overlay snap cleared)")
-            elif key == ord(","):
-                extend_up = max(1.0, extend_up - 0.5)
-                print(f"  extend_up → {extend_up:.1f} m")
-            elif key == ord("."):
-                extend_up = min(20.0, extend_up + 0.5)
-                print(f"  extend_up → {extend_up:.1f} m")
-            elif key in (ord("k"), ord("K")):
-                half = baseline / 2.0
-                did = False
-                if len(clicks.far_l) >= 2:
-                    aff, _moved, note = overlay_snap_to_clicks(
-                        P1, clicks.far_l, +half, 0.0, extend_up,
-                    )
-                    if aff is None:
-                        print(f"  Left snap skipped — {note}")
-                    else:
-                        snap_l = aff
-                        print(f"  Left overlay moved with yellow post  {note}")
-                    did = True
-                if len(clicks.far_r) >= 2:
-                    aff, _moved, note = overlay_snap_to_clicks(
-                        P2, clicks.far_r, -half, 0.0, extend_up,
-                    )
-                    if aff is None:
-                        print(f"  Right snap skipped — {note}")
-                    else:
-                        snap_r = aff
-                        print(f"  Right overlay moved with yellow post  {note}")
-                    did = True
-                if not did:
-                    print("  Click BOTTOM then TOP of the far post, then K if needed")
-            elif key in (ord("r"), ord("R")):
-                h_left = float(cfg.H_ANGLE_DEG)
-                h_right = -float(cfg.H_ANGLE_DEG)
-                v_angle = float(cfg.V_ANGLE_DEG)
-                snap_l = snap_r = None
-                print(f"  Reset overlay → HL={h_left:.1f} HR={h_right:.1f} V={v_angle:.1f}")
-            elif key in (ord("b"), ord("B")):
-                ball_on = not ball_on
-                ball_dets = (None, None)
-                ball_sched.reset()
-                motion_l.reset()
-                motion_r.reset()
-                ball_latch["prev_z"] = None
-                ball_latch["latch"] = None
-                print(f"  Ball detection {'ON' if ball_on else 'OFF'}")
-            elif key in (ord("d"), ord("D")):
-                show_labels = not show_labels
-                print(f"  Landmark distance labels {'ON' if show_labels else 'OFF'}")
-            elif key in (ord("u"), ord("U")):
-                flip_ud = not flip_ud
-                clicks.clear()
-                snap_l = snap_r = None
-                ball_dets = (None, None)
-                ball_sched.reset()
-                motion_l.reset()
-                motion_r.reset()
-                print(f"  {rotate_label(rotate_deg, flip_ud)}  (clicks cleared)")
-            elif key in (ord("o"), ord("O")):
-                rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
-                clicks.clear()
-                snap_l = snap_r = None
-                ball_dets = (None, None)
-                ball_sched.reset()
-                motion_l.reset()
-                motion_r.reset()
-                print(f"  {rotate_label(rotate_deg, flip_ud)}  (clicks cleared)")
-            elif key in (ord("s"), ord("S")):
-                save_plane(
-                    baseline, behind, abs(h_left), v_angle, extend_up,
-                    focal_px, img_w, img_h, clicks, rotate_deg,
-                    h_left=h_left, h_right=h_right,
-                    v_left=v_angle, v_right=v_angle,
-                    snap_l=snap_l, snap_r=snap_r,
-                    flip_ud=flip_ud,
-                )
-            elif key in (ord("l"), ord("L")):
-                data = load_plane()
-                if data is None:
-                    print("  No plane.json found")
-                else:
-                    h_left = float(data.get("h_left_deg", data.get("h_angle_deg", h_left)))
-                    h_right = float(data.get("h_right_deg", -abs(h_left)))
-                    v_angle = float(data.get("v_angle_deg", v_angle))
-                    extend_up = float(data.get("extend_up_m", extend_up))
-                    behind = float(data.get("cam_behind_post_m", behind))
-                    xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
-                    pos_l = np.array(xyz_l)
-                    pos_r = np.array(xyz_r)
-                    rotate_deg, flip_ud = orient_from_dict(data, rotate_deg, flip_ud)
-                    ball_dets = (None, None)
-                    ball_sched.reset()
-                    motion_l.reset()
-                    motion_r.reset()
-                    clicks.load_dict(data.get("clicks", {}))
-                    sl = data.get("overlay_snap_left")
-                    sr = data.get("overlay_snap_right")
-                    snap_l = None if sl is None else np.array(sl, dtype=np.float64)
-                    snap_r = None if sr is None else np.array(sr, dtype=np.float64)
-                    print(
-                        f"  Loaded {PLANE_PATH}  HL={h_left:.1f} HR={h_right:.1f} "
-                        f"V={v_angle:.1f}  behind={behind:.3f} m  "
-                        f"{rotate_label(rotate_deg, flip_ud)}"
-                    )
-
-    except RuntimeError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-    finally:
-        if cap_l is not None:
-            cap_l.release()
-        if cap_r is not None:
-            cap_r.release()
-        cv2.destroyAllWindows()
-
-    return 0
-
+# ─── CLI ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import sys
+    print(
+        "stereo_plane_calib.py is a helper library for score_live.\n"
+        "Run:  python capture/score_live.py",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)

@@ -113,6 +113,7 @@ class AsyncBallDetect:
                 with self._lock:
                     self._error = str(e)
                     self._result = (None, None)
+                print(f"  YOLO error: {e}")
             finally:
                 with self._lock:
                     self._busy = False
@@ -324,8 +325,8 @@ def main() -> int:
         type=int,
         default=None,
         metavar="N",
-        help="Draw/detect the ball every N video frames (1=every frame). "
-             "At ~20 FPS, --every 2 ≈ 10 updates/sec",
+        help="Deep-field / search: YOLO every N frames (near posts stays every frame). "
+             "At ~20 FPS, --every 2 ≈ 10 updates/sec away from the goal",
     )
     parser.add_argument("--device", type=str, default=plane.YOLO_DEVICE, help="YOLO device (cpu or 0)")
     parser.add_argument("--replay-s", type=float, default=None)
@@ -413,7 +414,7 @@ def main() -> int:
     yolo_device = str(args.device)
     motion_gate = not bool(args.no_motion_gate)
     replay_s = max(2.0, float(args.replay_s))
-    # One simple knob: detect every N frames (same near the posts and far away).
+    # Deep-field / search: every N frames. Near the posts: always NEAR_STRIDE (1).
     if args.every is not None:
         detect_every = max(1, int(args.every))
     elif slow:
@@ -423,7 +424,6 @@ def main() -> int:
     stale_frames = SLOW_STALE_FRAMES if slow else plane.STALE_DET_FRAMES
 
     clicks = plane.ClickState()
-    clicks.mode = "far"
     snap_l: np.ndarray | None = None
     snap_r: np.ndarray | None = None
     mode = Mode.ALIGN
@@ -436,7 +436,7 @@ def main() -> int:
     ball_sched = plane.BallDetectScheduler(
         idle_stride=detect_every,
         search_stride=detect_every,
-        near_stride=detect_every,
+        near_stride=plane.NEAR_STRIDE,
         stale_frames=stale_frames,
     )
     async_det = AsyncBallDetect()
@@ -644,11 +644,11 @@ def main() -> int:
             compact = mode != Mode.ALIGN
             plane.draw_goal_plane(
                 disp_l, P1, baseline, extend_up, pos_l, pos_r, "L",
-                show_point_labels=False, y_vis_min=y_vis, affine=snap_l, compact=compact,
+                y_vis_min=y_vis, affine=snap_l, compact=compact,
             )
             plane.draw_goal_plane(
                 disp_r, P2, baseline, extend_up, pos_l, pos_r, "R",
-                show_point_labels=False, y_vis_min=y_vis, affine=snap_r, compact=compact,
+                y_vis_min=y_vis, affine=snap_r, compact=compact,
             )
             if mode == Mode.ALIGN:
                 clicks.draw_on(disp_l, disp_r)
@@ -697,8 +697,8 @@ def main() -> int:
                     last_event_call = ball_call
 
             show_n = mode == Mode.ALIGN
-            plane.draw_camera_hud(disp_l, "L", rotate_deg, show_north=show_n, flip_ud=flip_ud)
-            plane.draw_camera_hud(disp_r, "R", rotate_deg, show_north=show_n, flip_ud=flip_ud)
+            plane.draw_camera_hud(disp_l, "L", show_north=show_n, flip_ud=flip_ud)
+            plane.draw_camera_hud(disp_r, "R", show_north=show_n, flip_ud=flip_ud)
             combo, panel_split_x = plane.side_by_side_full(disp_l, disp_r)
 
             color, banner, pulse = plane.call_style(ball_call)

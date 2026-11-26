@@ -28,6 +28,8 @@ Put weights at `models/football_yolov8n.pt` (or train below).
 
 ## Run
 
+The live app is `capture/score_live.py`. Other `capture/*.py` files are helpers it imports (geometry, plane overlay, AE, motion).
+
 ```bash
 python capture/score_live.py --list
 python capture/score_live.py --left /dev/video4 --right /dev/video1

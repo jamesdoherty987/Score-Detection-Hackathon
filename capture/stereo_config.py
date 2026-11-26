@@ -43,9 +43,6 @@ World frame
 from __future__ import annotations
 
 import math
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Physical rig ─────────────────────────────────────────────────────────────
 
@@ -64,9 +61,6 @@ DATASHEET_HFOV_DEG: float = 70.0      # along 1280-px axis when upright
 DATASHEET_VFOV_DEG: float = 47.3      # along 800-px axis when upright
 DATASHEET_WIDTH: int = 1280
 DATASHEET_HEIGHT: int = 800
-FOCAL_TOLERANCE_PCT: float = 5.0
-DISTORTION_PCT: float = 1.5
-
 # ── As mounted: cameras rotated 90° (sideways) ───────────────────────────────
 # Image axes after sideways mount (rotate frames if the driver still outputs
 # 1280×800 landscape — projection assumes image Y is downward on the sensor
@@ -92,11 +86,6 @@ NATIVE_HEIGHT: int = DATASHEET_WIDTH   # 1280
 
 FOCAL_FX_SPEC: float = (NATIVE_WIDTH / 2.0) / math.tan(math.radians(HFOV_DEG / 2.0))
 FOCAL_FY_SPEC: float = (NATIVE_HEIGHT / 2.0) / math.tan(math.radians(VFOV_DEG / 2.0))
-# Keep a single "spec" scalar for older call sites (prefer fx for width scaling)
-FOCAL_PX_SPEC: float = FOCAL_FX_SPEC
-
-# Lowest optical ray above horizontal: V_ANGLE − VFOV/2
-LOWEST_RAY_DEG: float = V_ANGLE_DEG - (VFOV_DEG / 2.0)
 
 
 def camera_positions(
