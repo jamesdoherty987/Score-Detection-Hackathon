@@ -256,39 +256,45 @@ def list_working_cameras(
     width: int | None = None,
     height: int | None = None,
 ) -> list[str]:
-    """Return capture nodes that open and deliver MJPG frames (usually the 2 cams)."""
-    w = DEFAULT_CAM_W if width is None else int(width)
-    h = DEFAULT_CAM_H if height is None else int(height)
-    found: list[str] = []
-    tested: set[str] = set()
+    """
+    Return capture camera nodes (usually the two OV9281 /dev/videoN paths).
 
-    def _try(spec: str | int, label: str) -> None:
-        key = str(spec)
-        if key in tested:
+    Does not open devices (opening can V4L2-timeout on the Pi). Prefers
+    by-path capture links; falls back to by-id, then bare /dev/video*.
+    """
+    _ = (width, height)  # kept so callers can pass cam size without changing API
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(device: str) -> None:
+        if not device or device in seen:
             return
-        tested.add(key)
-        try:
-            cap = open_camera(spec, width=w, height=h, quiet=True)
-            cap.release()
-            time.sleep(0.15)
-            found.append(label)
-        except RuntimeError:
-            pass
+        if not Path(device).exists():
+            return
+        seen.add(device)
+        found.append(device)
 
     rows = list_linux_camera_links()
-    for r in rows:
-        if r["role"] != "capture":
-            continue
-        # Prefer plain /dev/videoN label when the link resolves to one.
-        device = r.get("device") or ""
-        label = device if device.startswith("/dev/video") else r["link"]
-        _try(r["link"], label)
+    # Prefer by-path (stable USB port), then by-id.
+    for kind in ("by-path", "by-id"):
+        for r in rows:
+            if r["kind"] != kind or r["role"] != "capture":
+                continue
+            device = r.get("device") or ""
+            if device.startswith("/dev/video"):
+                _add(device)
 
     if not found:
-        for i in range(8):
+        # Last resort: every /dev/videoN that isn't tagged metadata.
+        meta = {
+            r["device"]
+            for r in rows
+            if r["role"] != "capture" and r.get("device", "").startswith("/dev/video")
+        }
+        for i in range(16):
             dev = f"/dev/video{i}"
-            if Path(dev).exists():
-                _try(i, dev)
+            if Path(dev).exists() and dev not in meta:
+                _add(dev)
 
     return found
 

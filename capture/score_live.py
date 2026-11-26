@@ -369,7 +369,7 @@ def main() -> int:
     if args.list:
         cams = plane.list_working_cameras(width=cam_w, height=cam_h)
         if not cams:
-            print("No working cameras found.", file=sys.stderr)
+            print("No cameras found under /dev/v4l or /dev/video*.", file=sys.stderr)
             return 1
         for name in cams:
             print(name)
