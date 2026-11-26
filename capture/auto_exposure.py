@@ -39,8 +39,9 @@ SOFTWARE_COMP_MAX = 1.0
 OUTDOOR_RAW_THRESHOLD = 200.0
 
 
-def try_set(cap: cv2.VideoCapture, prop: int, value: float) -> bool:
+def try_set(cap: cv2.VideoCapture, prop: int, value: float | int) -> bool:
     try:
+        # Keep ints as ints (FOURCC codes are corrupted if cast to float).
         return bool(cap.set(prop, value))
     except Exception:
         return False

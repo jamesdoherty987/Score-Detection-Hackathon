@@ -191,17 +191,42 @@ DEFAULT_CAM_W, DEFAULT_CAM_H = 640, 480
 DEFAULT_CAM_FPS = 30.0
 
 
-def _backends() -> list[tuple[str, int]]:
+def _fourcc_mjpg() -> int:
+    # Must stay int — float() corrupts FOURCC values above 2^24.
+    return int(cv2.VideoWriter_fourcc(*"MJPG"))
+
+
+def _fourcc_to_str(code: float | int) -> str:
+    n = int(code)
+    if n <= 0:
+        return "?"
+    return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4))
+
+
+def _linux_capture_targets(index: int) -> list[tuple[str, object, int]]:
+    """
+    Linux/Pi: open the real V4L2 capture node only.
+    Prefer /dev/videoN path + CAP_V4L2 — never CAP_ANY (it can hit metadata nodes).
+    """
+    targets: list[tuple[str, object, int]] = []
+    dev = f"/dev/video{int(index)}"
+    if Path(dev).exists():
+        targets.append((f"V4L2 {dev}", dev, cv2.CAP_V4L2))
+    # Index + V4L2 only (same node when udev numbering matches).
+    targets.append((f"V4L2 index {int(index)}", int(index), cv2.CAP_V4L2))
+    return targets
+
+
+def _open_targets(index: int) -> list[tuple[str, object, int]]:
     s = platform.system()
-    if s == "Darwin":
-        return [("AVFoundation", cv2.CAP_AVFOUNDATION), ("default", cv2.CAP_ANY)]
     if s == "Linux":
-        return [("V4L2", cv2.CAP_V4L2), ("default", cv2.CAP_ANY)]
-    return [("MSMF", cv2.CAP_MSMF), ("DirectShow", cv2.CAP_DSHOW), ("default", cv2.CAP_ANY)]
-
-
-def _fourcc_mjpg() -> float:
-    return float(cv2.VideoWriter_fourcc(*"MJPG"))
+        return _linux_capture_targets(index)
+    if s == "Darwin":
+        return [("AVFoundation", int(index), cv2.CAP_AVFOUNDATION)]
+    return [
+        ("MSMF", int(index), cv2.CAP_MSMF),
+        ("DirectShow", int(index), cv2.CAP_DSHOW),
+    ]
 
 
 def configure_capture(
@@ -219,7 +244,6 @@ def configure_capture(
     try_set(cap, cv2.CAP_PROP_FPS, float(fps))
     # Keep a few buffered frames; LatestFrameCam drains to the newest.
     try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 3.0)
-    try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
     # Re-assert after geometry — drivers often reset FOURCC on size change.
     try_set(cap, cv2.CAP_PROP_FOURCC, mjpg)
 
@@ -232,27 +256,43 @@ def open_camera(
     w = DEFAULT_CAM_W if width is None else int(width)
     h = DEFAULT_CAM_H if height is None else int(height)
     last_err = f"Could not open camera {index}."
-    for name, backend in _backends():
-        print(f"  Trying camera {index} via {name} (MJPG {w}×{h})...")
-        cap = cv2.VideoCapture(index, backend)
-        if not cap.isOpened():
-            cap.release()
+    seen: set[str] = set()
+
+    for name, source, backend in _open_targets(index):
+        if name in seen:
             continue
+        seen.add(name)
+        print(f"  Trying {name} (MJPG {w}×{h})...")
+        cap = cv2.VideoCapture(source, backend)
+        if not cap.isOpened():
+            try:
+                cap.release()
+            except Exception:
+                pass
+            last_err = f"{name}: open failed (not a capture device?)."
+            continue
+
         configure_capture(cap, width=w, height=h)
+
         ok, frame = False, None
-        for _ in range(30):
+        for _ in range(40):
             ok, frame = cap.read()
             if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
                 break
-            time.sleep(0.03)
+            time.sleep(0.025)
+
         if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
             fh, fw = frame.shape[:2]
-            fourcc = int(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
-            fourcc_s = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4))
+            fourcc_s = _fourcc_to_str(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
             print(f"  Camera {index} OK via {name} — {fw}×{fh} fourcc={fourcc_s!r}")
             return cap
-        cap.release()
-        last_err = f"Camera {index} via {name}: no valid frames (tried MJPG {w}×{h})."
+
+        try:
+            cap.release()
+        except Exception:
+            pass
+        last_err = f"{name}: opened but no frames at MJPG {w}×{h}."
+
     raise RuntimeError(last_err)
 
 
