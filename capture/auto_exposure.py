@@ -407,11 +407,18 @@ class SoftwareAutoExposure:
         else:
             self._track_hardware_effect(raw_brightness, raw_error)
 
-    def settle(self, lock: bool = LOCK_AFTER_SETTLE) -> None:
+    def settle(
+        self,
+        lock: bool = LOCK_AFTER_SETTLE,
+        loops: int | None = None,
+        label: str = "",
+    ) -> None:
         """Run a loop so sky brightness is corrected before tracking."""
-        print("Auto-adjusting exposure for sky view (ball-path band)...")
+        tag = f"{label} " if label else ""
+        print(f"Auto-adjusting {tag}exposure for sky view (ball-path band)...")
         stable_count = 0
-        for _ in range(AE_SETTLE_LOOPS):
+        n = AE_SETTLE_LOOPS if loops is None else max(1, int(loops))
+        for _ in range(n):
             ok, frame = read_frame(self.cap)
             if not ok or frame is None:
                 continue
@@ -429,4 +436,4 @@ class SoftwareAutoExposure:
             ok, frame = read_frame(self.cap)
             if ok and frame is not None:
                 self.last_brightness = frame_brightness(self.apply(frame))
-        print(f"Exposure ready: {self.status_text()}")
+        print(f"  {tag}Exposure ready: {self.status_text()}")

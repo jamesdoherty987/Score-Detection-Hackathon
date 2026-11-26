@@ -23,6 +23,7 @@ Keys
   ←/→ or A/D  Scrub replay (in REPLAY only for A; A alone = Align in other modes)
   B           Toggle ball detection
   D           Toggle verbose dbg line
+  E           Lock / unlock per-camera auto-exposure
   C / K       Clear clicks / re-snap (Align)
   O / F       Cycle sideways rotate / toggle upside-down flip
   R / S / L   reset / save / load
@@ -52,8 +53,12 @@ from ultralytics import YOLO
 
 import stereo_config as cfg
 import stereo_plane_calib as plane
+from auto_exposure import SoftwareAutoExposure
 from sky_motion import SkyMotionDetector
 from stereo_calibrate import make_proj_matrix
+
+# Short settle at startup (full AE_SETTLE_LOOPS is slow with two cams).
+AE_SETTLE_LOOPS_LIVE = 24
 
 
 class AsyncBallDetect:
@@ -332,6 +337,11 @@ def main() -> int:
         help="Pi-friendly: smaller YOLO input + lighter defaults",
     )
     parser.add_argument("--no-motion-gate", action="store_true")
+    parser.add_argument(
+        "--no-ae",
+        action="store_true",
+        help="Disable per-camera auto-exposure (L/R each meter the ball-path band)",
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -485,6 +495,21 @@ def main() -> int:
             raw_r.release()
             return 1
 
+        # Per-camera AE before reader threads (init/settle read the caps directly).
+        use_ae = not bool(args.no_ae)
+        ae_l: SoftwareAutoExposure | None = None
+        ae_r: SoftwareAutoExposure | None = None
+        if use_ae:
+            print("\nPer-camera auto-exposure (independent L/R)...")
+            ae_l = SoftwareAutoExposure(raw_l)
+            ae_l.settle(lock=False, loops=AE_SETTLE_LOOPS_LIVE, label="L")
+            ae_r = SoftwareAutoExposure(raw_r)
+            ae_r.settle(lock=False, loops=AE_SETTLE_LOOPS_LIVE, label="R")
+            print(f"  L {ae_l.status_text()}")
+            print(f"  R {ae_r.status_text()}")
+        else:
+            print("\nAuto-exposure OFF (--no-ae)")
+
         # Only after dual streaming works: gentle per-camera reader threads.
         cap_l = plane.LatestFrameCam(raw_l, name="L")
         cap_r = plane.LatestFrameCam(raw_r, name="R")
@@ -498,6 +523,10 @@ def main() -> int:
             )
             return 1
         probe_l, probe_r = live_l, live_r
+        if ae_l is not None:
+            probe_l = ae_l.process(probe_l)
+        if ae_r is not None:
+            probe_r = ae_r.process(probe_r)
         raw_wh_l = (probe_l.shape[1], probe_l.shape[0])
         raw_wh_r = (probe_r.shape[1], probe_r.shape[0])
         print(
@@ -573,6 +602,11 @@ def main() -> int:
                     time.sleep(0.01)
                     continue
                 frame_l, frame_r = next_l, next_r
+                # Independent L/R exposure: each meters its own ball-path band.
+                if ae_l is not None:
+                    frame_l = ae_l.process(frame_l)
+                if ae_r is not None:
+                    frame_r = ae_r.process(frame_r)
                 raw_wh_l = (frame_l.shape[1], frame_l.shape[0])
                 raw_wh_r = (frame_r.shape[1], frame_r.shape[0])
             else:
@@ -716,6 +750,9 @@ def main() -> int:
             lines = [
                 f"{hint}   {fps_ema:.0f} fps",
             ]
+            if verbose_dbg and ae_l is not None and ae_r is not None and mode != Mode.REPLAY:
+                lines.append(f"L {ae_l.status_text()}")
+                lines.append(f"R {ae_r.status_text()}")
             if verbose_dbg and ball_line and mode == Mode.PLAY:
                 lines.append(ball_line)
 
@@ -820,6 +857,19 @@ def main() -> int:
             elif key in (ord("d"), ord("D")) and mode != Mode.REPLAY:
                 verbose_dbg = not verbose_dbg
                 print(f"  Verbose dbg {'ON' if verbose_dbg else 'OFF'}")
+            elif key in (ord("e"), ord("E")) and ae_l is not None and ae_r is not None:
+                if ae_l.locked:
+                    ae_l.unlock()
+                    ae_r.unlock()
+                    print("  Auto-exposure unlocked (adjusting)")
+                else:
+                    ae_l.lock()
+                    ae_r.lock()
+                    print(
+                        f"  Auto-exposure locked\n"
+                        f"    L {ae_l.status_text()}\n"
+                        f"    R {ae_r.status_text()}"
+                    )
             elif key in (ord("c"), ord("C")) and mode == Mode.ALIGN:
                 clicks.clear()
                 print("  Clicks cleared")

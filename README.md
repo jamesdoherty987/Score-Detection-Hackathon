@@ -37,6 +37,8 @@ Defaults are `/dev/video4` (left) and `/dev/video1` (right) for the current OV92
 
 Upside-down mount is on by default (`FLIP_UD` in `stereo_config`). Press **F** to toggle, or pass `--no-flip` if the cams are right-side up. **O** cycles sideways rotate (0/90/270).
 
+Each camera runs its own auto-exposure (useful when one faces more sky/sun). Press **E** to lock/unlock, **D** to show L/R AE status, or `--no-ae` to turn it off.
+
 For stable selection (USB port), use `by-path` links from `--list`:
 
 ```bash
