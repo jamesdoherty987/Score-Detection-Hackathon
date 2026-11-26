@@ -208,11 +208,13 @@ def open_camera(
     spec: str | int,
     width: int | None = None,
     height: int | None = None,
+    quiet: bool = False,
 ) -> cv2.VideoCapture:
     w = DEFAULT_CAM_W if width is None else int(width)
     h = DEFAULT_CAM_H if height is None else int(height)
     name, source, backend = resolve_camera_source(spec)
-    print(f"  Opening {name} (MJPG {w}×{h})...")
+    if not quiet:
+        print(f"  Opening {name} (MJPG {w}×{h})...")
     cap = cv2.VideoCapture(source, backend)
     if not cap.isOpened():
         try:
@@ -232,7 +234,7 @@ def open_camera(
         ok, frame = cap.read()
         if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
             break
-        if attempt in (0, 9, 19, 39):
+        if not quiet and attempt in (0, 9, 19, 39):
             print(f"    … waiting for first frame ({attempt + 1}/40)")
         time.sleep(0.025)
 
@@ -243,37 +245,52 @@ def open_camera(
             pass
         raise RuntimeError(f"{name}: opened but no frames at MJPG {w}×{h}.")
 
-    fh, fw = frame.shape[:2]
-    fourcc_s = _fourcc_to_str(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
-    print(f"  OK — {fw}×{fh} fourcc={fourcc_s!r}  (single-cam read OK)")
+    if not quiet:
+        fh, fw = frame.shape[:2]
+        fourcc_s = _fourcc_to_str(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
+        print(f"  OK — {fw}×{fh} fourcc={fourcc_s!r}  (single-cam read OK)")
     return cap
 
-def print_camera_list() -> None:
-    """Print indexes + stable by-id/by-path links for --list."""
-    print("Linux V4L camera links (prefer 'capture' + by-path if cams are identical):")
+
+def list_working_cameras(
+    width: int | None = None,
+    height: int | None = None,
+) -> list[str]:
+    """Return capture nodes that open and deliver MJPG frames (usually the 2 cams)."""
+    w = DEFAULT_CAM_W if width is None else int(width)
+    h = DEFAULT_CAM_H if height is None else int(height)
+    found: list[str] = []
+    tested: set[str] = set()
+
+    def _try(spec: str | int, label: str) -> None:
+        key = str(spec)
+        if key in tested:
+            return
+        tested.add(key)
+        try:
+            cap = open_camera(spec, width=w, height=h, quiet=True)
+            cap.release()
+            time.sleep(0.15)
+            found.append(label)
+        except RuntimeError:
+            pass
+
     rows = list_linux_camera_links()
-    if not rows:
-        if platform.system() != "Linux":
-            print("  (only available on Linux/Pi)")
-        else:
-            print("  (none found under /dev/v4l/by-id or by-path)")
     for r in rows:
-        print(f"  [{r['role']:9}] {r['kind']:7}  {r['device']:14}  {r['link']}")
-    print("\nQuick index probe (capture nodes only — may fail on metadata):")
-    for i in range(0, 8, 1):
-        dev = Path(f"/dev/video{i}")
-        if not dev.exists():
+        if r["role"] != "capture":
             continue
-        # Skip obvious metadata indexes when by-id says so.
-        meta = any(
-            r["device"] == str(dev.resolve()) and r["role"] != "capture"
-            for r in rows
-            if Path(r["device"]).exists()
-        )
-        if meta:
-            print(f"  {i}: {dev}  (likely metadata — skip)")
-            continue
-        print(f"  {i}: {dev}")
+        # Prefer plain /dev/videoN label when the link resolves to one.
+        device = r.get("device") or ""
+        label = device if device.startswith("/dev/video") else r["link"]
+        _try(r["link"], label)
+
+    if not found:
+        for i in range(8):
+            dev = f"/dev/video{i}"
+            if Path(dev).exists():
+                _try(i, dev)
+
+    return found
 
 def read_cam(
     cap: cv2.VideoCapture,

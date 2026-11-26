@@ -35,7 +35,7 @@ python capture/score_live.py --list
 python capture/score_live.py --left /dev/video4 --right /dev/video1
 ```
 
-Defaults are `/dev/video4` (left) and `/dev/video1` (right) for the current OV9281 pair. Confirm with `--list` / `v4l2-ctl` if your nodes differ.
+`--list` prints only the working camera nodes (usually two `/dev/videoN` lines). Defaults are `/dev/video4` (left) and `/dev/video1` (right); use whatever `--list` shows if those differ.
 
 Upside-down mount is on by default (`FLIP_UD` in `stereo_config`). Press **F** to toggle, or pass `--no-flip` if the cams are right-side up. **O** cycles sideways rotate (0/90/270).
 

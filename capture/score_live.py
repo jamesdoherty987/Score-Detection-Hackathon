@@ -367,32 +367,12 @@ def main() -> int:
         args.replay_s = PI_REPLAY_S if on_pi else REPLAY_S
 
     if args.list:
-        plane.print_camera_list()
-        print("\nOpen-test capture candidates (MJPG):")
-        tested: set[str] = set()
-        for r in plane.list_linux_camera_links():
-            if r["role"] != "capture":
-                continue
-            key = r["device"]
-            if key in tested:
-                continue
-            tested.add(key)
-            try:
-                cap = plane.open_camera(r["link"], width=cam_w or plane.DEFAULT_CAM_W, height=cam_h or plane.DEFAULT_CAM_H)
-                print(f"  → OK  {r['link']}")
-                cap.release()
-                time.sleep(0.2)
-            except RuntimeError as e:
-                print(f"  → FAIL {r['link']}: {e}")
-        if not tested:
-            for i in (0, 2, 1, 3, 4, 5):
-                try:
-                    cap = plane.open_camera(i, width=cam_w or plane.DEFAULT_CAM_W, height=cam_h or plane.DEFAULT_CAM_H)
-                    print(f"  → OK  index {i}")
-                    cap.release()
-                    time.sleep(0.2)
-                except RuntimeError as e:
-                    print(f"  → FAIL index {i}: {e}")
+        cams = plane.list_working_cameras(width=cam_w, height=cam_h)
+        if not cams:
+            print("No working cameras found.", file=sys.stderr)
+            return 1
+        for name in cams:
+            print(name)
         return 0
 
     if str(args.left).strip() == str(args.right).strip():
