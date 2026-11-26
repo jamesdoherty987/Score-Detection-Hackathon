@@ -233,16 +233,12 @@ def main() -> int:
         help=f"YOLO size (default {plane.IMAGE_SIZE}; lower = faster)",
     )
     parser.add_argument(
-        "--yolo-stride",
-        type=int,
-        default=plane.IDLE_YOLO_STRIDE,
-        help=f"Deep-field YOLO every N frames (default {plane.IDLE_YOLO_STRIDE}; lower = more often)",
-    )
-    parser.add_argument(
-        "--near-stride",
+        "--every",
         type=int,
         default=None,
-        help="YOLO every N frames near the posts (default 1, or 2 with --slow-demo)",
+        metavar="N",
+        help="Draw/detect the ball every N video frames (1=every frame). "
+             "At ~20 FPS, --every 2 ≈ 10 updates/sec",
     )
     parser.add_argument("--device", type=str, default=plane.YOLO_DEVICE, help="YOLO device (cpu or 0)")
     parser.add_argument("--replay-s", type=float, default=None)
@@ -251,7 +247,7 @@ def main() -> int:
     parser.add_argument(
         "--slow-demo",
         action="store_true",
-        help="Hand-held slow ball on Pi: tiny YOLO, rare runs, smaller cams",
+        help="Pi-friendly: smaller YOLO input + lighter defaults",
     )
     parser.add_argument("--no-motion-gate", action="store_true")
     parser.add_argument("--list", action="store_true")
@@ -261,8 +257,6 @@ def main() -> int:
     if slow:
         if args.imgsz == plane.IMAGE_SIZE:
             args.imgsz = SLOW_IMGSZ
-        if args.yolo_stride == plane.IDLE_YOLO_STRIDE:
-            args.yolo_stride = SLOW_YOLO_STRIDE
         if args.cam_width is None:
             args.cam_width = SLOW_CAM_W
         if args.cam_height is None:
@@ -325,12 +319,13 @@ def main() -> int:
     yolo_device = str(args.device)
     motion_gate = not bool(args.no_motion_gate)
     replay_s = max(2.0, float(args.replay_s))
-    search_stride = SLOW_SEARCH_STRIDE if slow else plane.SEARCH_STRIDE
-    near_stride = (
-        int(args.near_stride)
-        if args.near_stride is not None
-        else (SLOW_NEAR_STRIDE if slow else plane.NEAR_STRIDE)
-    )
+    # One simple knob: detect every N frames (same near the posts and far away).
+    if args.every is not None:
+        detect_every = max(1, int(args.every))
+    elif slow:
+        detect_every = SLOW_YOLO_STRIDE
+    else:
+        detect_every = plane.IDLE_YOLO_STRIDE
     stale_frames = SLOW_STALE_FRAMES if slow else plane.STALE_DET_FRAMES
 
     clicks = plane.ClickState()
@@ -345,9 +340,9 @@ def main() -> int:
     ball_classes: list[int] | None = None
     ball_dets: tuple = (None, None)
     ball_sched = plane.BallDetectScheduler(
-        idle_stride=int(args.yolo_stride),
-        search_stride=search_stride,
-        near_stride=near_stride,
+        idle_stride=detect_every,
+        search_stride=detect_every,
+        near_stride=detect_every,
         stale_frames=stale_frames,
     )
     motion_l = SkyMotionDetector(warmup_frames=8)
@@ -383,8 +378,7 @@ def main() -> int:
             tag = "slow-demo" if slow else "Raspberry Pi"
             print(
                 f"{tag}: cam {cam_w}x{cam_h}, imgsz={yolo_imgsz}, "
-                f"device={yolo_device}, stride={int(args.yolo_stride)}, "
-                f"near={near_stride}, search={search_stride}"
+                f"device={yolo_device}, every={detect_every}"
             )
         # Always request an explicit size so configure_capture can lock MJPEG.
         cam_w = plane.DEFAULT_CAM_W if cam_w is None else int(cam_w)
