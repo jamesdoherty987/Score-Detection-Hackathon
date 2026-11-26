@@ -511,26 +511,38 @@ def is_still_path(path: Path) -> bool:
 
 def orient_frame(frame: np.ndarray, rotate_deg: int) -> np.ndarray:
     """
-    Rotate landscape captures to portrait for the sideways mount.
-    Already-portrait frames (height >= width) are unchanged.
-    rotate_deg: 90 clockwise, 270 counter-clockwise, 0 skip.
+    rotate_deg:
+      0   = no change
+      180 = upside down
+      90  = clockwise (sideways mount → portrait)
+      270 = counter-clockwise
+    For 90/270 with CAMERAS_SIDEWAYS, already-portrait frames are left as-is.
     """
-    if not cfg.CAMERAS_SIDEWAYS or rotate_deg == 0:
+    if rotate_deg == 0:
         return frame
-    h, w = frame.shape[:2]
-    if h >= w:
-        return frame
+    if rotate_deg == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
     if rotate_deg == 270:
+        if cfg.CAMERAS_SIDEWAYS and frame.shape[0] >= frame.shape[1]:
+            return frame
         return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotate_deg == 90:
+        if cfg.CAMERAS_SIDEWAYS and frame.shape[0] >= frame.shape[1]:
+            return frame
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
 
 
 def rotate_label(deg: int) -> str:
-    if not cfg.CAMERAS_SIDEWAYS or deg == 0:
+    if deg == 0:
         return "rotate=off"
+    if deg == 180:
+        return "rotate=180 (upside down)"
     if deg == 270:
         return "rotate=270 CCW"
-    return "rotate=90 CW"
+    if deg == 90:
+        return "rotate=90 CW"
+    return f"rotate={deg}"
 
 
 def draw_camera_hud(

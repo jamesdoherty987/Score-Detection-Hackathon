@@ -284,7 +284,13 @@ def main() -> int:
     parser.add_argument("--v-angle", type=float, default=cfg.V_ANGLE_DEG)
     parser.add_argument("--extend", type=float, default=4.0)
     parser.add_argument("--focal", type=float, default=None)
-    parser.add_argument("--rotate", type=int, default=None, choices=(0, 90, 270))
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=None,
+        choices=(0, 90, 180, 270),
+        help="0=off, 180=upside down, 90/270=sideways mount",
+    )
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--conf", type=float, default=plane.CONFIDENCE)
     parser.add_argument(
@@ -374,7 +380,7 @@ def main() -> int:
     h_right = -float(args.h_angle)
     v_angle = float(args.v_angle)
     rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
-    if rotate_deg not in (0, 90, 270):
+    if rotate_deg not in (0, 90, 180, 270):
         rotate_deg = 90
     yolo_imgsz = max(128, int(args.imgsz))
     yolo_device = str(args.device)
@@ -521,7 +527,7 @@ def main() -> int:
             pos_l = np.array(xyz_l)
             pos_r = np.array(xyz_r)
             rd = int(data.get("rotate_deg", rotate_deg))
-            if rd in (0, 90, 270):
+            if rd in (0, 90, 180, 270):
                 rotate_deg = rd
             clicks.load_dict(data.get("clicks", {}))
             sl = data.get("overlay_snap_left")
@@ -806,7 +812,7 @@ def main() -> int:
                         "R", clicks, P1, P2, baseline, extend_up, snap_l, snap_r,
                     )
             elif key in (ord("o"), ord("O")):
-                rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
+                rotate_deg = {90: 180, 180: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
                 clicks.clear()
                 snap_l = snap_r = None
                 ball_dets = (None, None)
@@ -845,7 +851,7 @@ def main() -> int:
                     pos_l = np.array(xyz_l)
                     pos_r = np.array(xyz_r)
                     rd = int(data.get("rotate_deg", rotate_deg))
-                    if rd in (0, 90, 270):
+                    if rd in (0, 90, 180, 270):
                         rotate_deg = rd
                     clicks.load_dict(data.get("clicks", {}))
                     sl = data.get("overlay_snap_left")
