@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import platform
 import sys
+import threading
 import time
 from collections import deque
 from enum import Enum, auto
@@ -51,6 +52,66 @@ import stereo_config as cfg
 import stereo_plane_calib as plane
 from sky_motion import SkyMotionDetector
 from stereo_calibrate import make_proj_matrix
+
+
+class AsyncBallDetect:
+    """Run YOLO off the UI thread so the video loop is not stuck at detect FPS."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._busy = False
+        self._result: tuple | None = None
+        self._error: str | None = None
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def poll(self) -> tuple | None:
+        with self._lock:
+            if self._result is None:
+                return None
+            out = self._result
+            self._result = None
+            return out
+
+    def submit(
+        self,
+        model: YOLO,
+        frame_l: np.ndarray,
+        frame_r: np.ndarray,
+        conf: float,
+        classes: list[int] | None,
+        imgsz: int,
+        device: str,
+    ) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+            self._error = None
+        # Copy so the UI thread can keep using its frames.
+        fl = frame_l.copy()
+        fr = frame_r.copy()
+
+        def _worker() -> None:
+            try:
+                dets = plane.detect_both(
+                    model, fl, fr, conf, classes, imgsz=imgsz, device=device,
+                )
+                with self._lock:
+                    self._result = dets
+            except Exception as e:
+                with self._lock:
+                    self._error = str(e)
+                    self._result = (None, None)
+            finally:
+                with self._lock:
+                    self._busy = False
+
+        threading.Thread(target=_worker, name="yolo-detect", daemon=True).start()
+        return True
 
 
 WINDOW = "Score Live"
@@ -345,6 +406,7 @@ def main() -> int:
         near_stride=detect_every,
         stale_frames=stale_frames,
     )
+    async_det = AsyncBallDetect()
     motion_l = SkyMotionDetector(warmup_frames=8)
     motion_r = SkyMotionDetector(warmup_frames=8)
     ball_latch: dict = {"prev_z": None, "latch": None, "latch_until": 0.0}
@@ -539,29 +601,33 @@ def main() -> int:
                     model, ball_classes = plane.load_ball_model(
                         args.model or plane.default_ball_model(),
                     )
-                mr_l = motion_l.process(view_l)
-                mr_r = motion_r.process(view_r)
-                has_motion = (not motion_gate) or bool(mr_l.blobs) or bool(mr_r.blobs)
-                run_yolo, _ym = ball_sched.should_run(has_motion, now)
-                if run_yolo:
-                    ball_dets = plane.detect_both(
-                        model,
-                        view_l,
-                        view_r,
-                        args.conf,
-                        ball_classes,
-                        imgsz=yolo_imgsz,
-                        device=yolo_device,
-                    )
+                # Apply finished YOLO work without blocking this frame.
+                done = async_det.poll()
+                if done is not None:
+                    ball_dets = done
                     ball_sched.note_yolo(ball_dets, now)
                     xyz = plane.estimate_ball_xyz(
                         ball_dets[0], ball_dets[1], P1, P2, pos_l, pos_r,
                     )
                     ball_sched.note_track(xyz, now)
-                else:
-                    ball_dets = ball_sched.held_dets()
-                    if ball_sched.last_mode == "idle":
-                        ball_dets = (None, None)
+
+                mr_l = motion_l.process(view_l)
+                mr_r = motion_r.process(view_r)
+                has_motion = (not motion_gate) or bool(mr_l.blobs) or bool(mr_r.blobs)
+                run_yolo, _ym = ball_sched.should_run(has_motion, now)
+                if run_yolo and not async_det.busy:
+                    async_det.submit(
+                        model,
+                        view_l,
+                        view_r,
+                        args.conf,
+                        ball_classes,
+                        yolo_imgsz,
+                        yolo_device,
+                    )
+                # Keep last boxes while a detect is in flight; clear when idle.
+                if ball_sched.last_mode == "idle" and not async_det.busy:
+                    ball_dets = (None, None)
                 ball_line, ball_call = plane.paint_ball_pair(
                     disp_l, disp_r, ball_dets[0], ball_dets[1],
                     P1, P2, pos_l, pos_r, baseline, now, ball_latch,
