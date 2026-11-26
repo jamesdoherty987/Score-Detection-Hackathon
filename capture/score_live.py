@@ -17,7 +17,8 @@ Modes
 Keys
 ────
   A           Align mode
-  Enter / P   Play
+  Enter / P   Play (needs both cams locked)
+  G           Play anyway (even if posts not snapped)
   I           Instant replay toggle
   ←/→ or A/D  Scrub replay (in REPLAY only for A; A alone = Align in other modes)
   B           Toggle ball detection
@@ -354,15 +355,17 @@ def main() -> int:
         cam_h = plane.DEFAULT_CAM_H if cam_h is None else int(cam_h)
 
         print(f"\nOpening left camera ({args.left}) @ MJPG {cam_w}×{cam_h}...")
-        cap_l = plane.open_camera(args.left, width=cam_w, height=cam_h)
+        raw_l = plane.open_camera(args.left, width=cam_w, height=cam_h)
         time.sleep(0.3)
         print(f"Opening right camera ({args.right}) @ MJPG {cam_w}×{cam_h}...")
-        cap_r = plane.open_camera(args.right, width=cam_w, height=cam_h)
-        # Warm both streams together so USB/MJPEG settles before the UI loop.
+        raw_r = plane.open_camera(args.right, width=cam_w, height=cam_h)
+        # Background readers keep the newest frames while YOLO runs (smoother video).
+        cap_l = plane.LatestFrameCam(raw_l)
+        cap_r = plane.LatestFrameCam(raw_r)
         probe_l = probe_r = None
-        for _ in range(15):
-            ok_l, probe_l = plane.read_cam(cap_l, retries=2)
-            ok_r, probe_r = plane.read_cam(cap_r, retries=2)
+        for _ in range(40):
+            ok_l, probe_l = cap_l.read(retries=1)
+            ok_r, probe_r = cap_r.read(retries=1)
             if ok_l and ok_r and probe_l is not None and probe_r is not None:
                 break
             time.sleep(0.05)
@@ -436,10 +439,10 @@ def main() -> int:
 
         while True:
             if mode != Mode.REPLAY:
-                ok_l, next_l = plane.read_cam(cap_l)
-                ok_r, next_r = plane.read_cam(cap_r)
+                ok_l, next_l = cap_l.read(retries=2)
+                ok_r, next_r = cap_r.read(retries=2)
                 if not ok_l or next_l is None or not ok_r or next_r is None:
-                    time.sleep(0.02)
+                    time.sleep(0.01)
                     continue
                 frame_l, frame_r = next_l, next_r
                 raw_wh_l = (frame_l.shape[1], frame_l.shape[0])
@@ -560,7 +563,11 @@ def main() -> int:
                     f"L {len(clicks.far_l)}/2  R {len(clicks.far_r)}/2   "
                     f"snap {'L' if snap_l is not None else '·'}"
                     f"{'R' if snap_r is not None else '·'}   "
-                    + ("Enter = PLAY" if aligned else "BOT→TOP far post each side")
+                    + (
+                        "Enter/P = PLAY"
+                        if aligned
+                        else "BOT→TOP far post each side  (G = PLAY anyway)"
+                    )
                 )
             elif mode == Mode.REPLAY:
                 hint = (
@@ -622,14 +629,44 @@ def main() -> int:
             elif key in (ord("a"), ord("A")):
                 mode = Mode.ALIGN
                 print("  → ALIGN")
-            elif key in (13, ord("p"), ord("P")):
+            elif key in (10, 13, ord("p"), ord("P")):  # 10=LF Enter on Linux, 13=CR
                 if mode == Mode.ALIGN and not aligned:
-                    print("  Lock BOTH cameras first (or L load plane.json)")
+                    # Retry snap in case clicks exist but last snap failed.
+                    if len(clicks.far_l) >= 2:
+                        snap_l, snap_r, _ = _try_snap(
+                            "L", clicks, P1, P2, baseline, extend_up, snap_l, snap_r,
+                        )
+                    if len(clicks.far_r) >= 2:
+                        snap_l, snap_r, _ = _try_snap(
+                            "R", clicks, P1, P2, baseline, extend_up, snap_l, snap_r,
+                        )
+                    aligned = snap_l is not None and snap_r is not None
+                if mode == Mode.ALIGN and not aligned:
+                    print(
+                        "  Not locked yet — "
+                        f"L clicks={len(clicks.far_l)}/2 R={len(clicks.far_r)}/2  "
+                        f"snap L={'yes' if snap_l is not None else 'no'} "
+                        f"R={'yes' if snap_r is not None else 'no'}"
+                    )
+                    print(
+                        "  Click BOT→TOP of the FAR post on each side "
+                        "(click the OpenCV window first). Or press G to PLAY anyway."
+                    )
                 else:
                     mode = Mode.PLAY
                     ball_sched.reset()
                     motion_l.reset()
                     motion_r.reset()
+                    print("  → PLAY")
+            elif key in (ord("g"), ord("G")):
+                # Force Play even without snaps (default plane geometry).
+                mode = Mode.PLAY
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
+                if not aligned:
+                    print("  → PLAY (no post snap — using default plane)")
+                else:
                     print("  → PLAY")
             elif key in (ord("i"), ord("I")):
                 if mode == Mode.REPLAY:

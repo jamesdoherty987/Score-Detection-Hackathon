@@ -69,6 +69,7 @@ import json
 import math
 import platform
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -216,8 +217,8 @@ def configure_capture(
     try_set(cap, cv2.CAP_PROP_FRAME_WIDTH, float(width))
     try_set(cap, cv2.CAP_PROP_FRAME_HEIGHT, float(height))
     try_set(cap, cv2.CAP_PROP_FPS, float(fps))
-    # Buffer 1 is fragile with two cams contending for USB; keep a couple frames.
-    try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 2.0)
+    # Keep a few buffered frames; LatestFrameCam drains to the newest.
+    try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 3.0)
     try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
     # Re-assert after geometry — drivers often reset FOURCC on size change.
     try_set(cap, cv2.CAP_PROP_FOURCC, mjpg)
@@ -258,14 +259,65 @@ def open_camera(
 def read_cam(
     cap: cv2.VideoCapture,
     retries: int = 5,
+    flush: int = 0,
 ) -> tuple[bool, np.ndarray | None]:
-    """Read one frame; retry briefly on V4L2 hiccups (dual-cam USB stalls)."""
+    """Read one frame; optional flush skips stale buffered frames."""
+    for _ in range(max(0, int(flush))):
+        if not cap.grab():
+            break
     for _ in range(max(1, int(retries))):
         ok, frame = cap.read()
         if ok and frame is not None and getattr(frame, "size", 0) > 0:
             return True, frame
         time.sleep(0.01)
     return False, None
+
+
+class LatestFrameCam:
+    """
+    Background reader that always keeps the newest frame.
+    Smooths the UI when the main thread stalls on YOLO.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self.cap = cap
+        self._lock = threading.Lock()
+        self._frame: np.ndarray | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="cam-latest", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            # Drop backlog so we display near-live frames, not old USB buffer.
+            for _ in range(2):
+                if not self.cap.grab():
+                    break
+            if not self.cap.grab():
+                time.sleep(0.005)
+                continue
+            ok, frame = self.cap.retrieve()
+            if not ok or frame is None or getattr(frame, "size", 0) == 0:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._frame = frame
+
+    def read(self, retries: int = 5) -> tuple[bool, np.ndarray | None]:
+        for _ in range(max(1, int(retries))):
+            with self._lock:
+                if self._frame is not None:
+                    return True, self._frame.copy()
+            time.sleep(0.01)
+        return False, None
+
+    def release(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        try:
+            self.cap.release()
+        except Exception:
+            pass
 
 
 def resolve_media_path(raw: str, kind: str) -> Path:
