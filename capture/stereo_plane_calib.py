@@ -52,12 +52,12 @@ Controls
   vertical. Already-portrait files are left as-is. The full frame is always
   shown (letterboxed); the status bar sits under the pictures, not on them.
   O = cycle rotate 90° CW / 270° CCW / off
+  U = toggle upside-down flip
 
 Usage
 ─────
   python capture/stereo_plane_calib.py --left 0 --right 1
   python capture/stereo_plane_calib.py --video-left left.mp4 --video-right right.mp4
-  python capture/stereo_plane_calib.py --image-left left.jpg --image-right right.jpg
   python capture/stereo_plane_calib.py --image-left left.jpg --image-right right.jpg --rotate 270
   python capture/stereo_plane_calib.py --list
 """
@@ -509,40 +509,71 @@ def is_still_path(path: Path) -> bool:
     return path.suffix.lower() in STILL_EXTS
 
 
-def orient_frame(frame: np.ndarray, rotate_deg: int) -> np.ndarray:
+def normalize_orient(rotate_deg: int, flip_ud: bool = False) -> tuple[int, bool]:
+    """Canonical orient: rotate in {0, 90, 270}, flip_ud bool.
+
+    Legacy plane.json with rotate_deg=180 becomes flip_ud=True.
     """
-    rotate_deg:
-      0   = no change
-      180 = upside down
-      90  = clockwise (sideways mount → portrait)
-      270 = counter-clockwise
-    For 90/270 with CAMERAS_SIDEWAYS, already-portrait frames are left as-is.
-    """
-    if rotate_deg == 0:
-        return frame
-    if rotate_deg == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if rotate_deg == 270:
-        if cfg.CAMERAS_SIDEWAYS and frame.shape[0] >= frame.shape[1]:
-            return frame
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    if rotate_deg == 90:
-        if cfg.CAMERAS_SIDEWAYS and frame.shape[0] >= frame.shape[1]:
-            return frame
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    return frame
+    rd = int(rotate_deg)
+    fu = bool(flip_ud)
+    if rd == 180:
+        fu = True
+        rd = int(cfg.SIDEWAYS_ROTATE_DEG) if cfg.CAMERAS_SIDEWAYS else 0
+    elif rd not in (0, 90, 270):
+        rd = int(cfg.SIDEWAYS_ROTATE_DEG) if cfg.CAMERAS_SIDEWAYS else 0
+    return rd, fu
 
 
-def rotate_label(deg: int) -> str:
-    if deg == 0:
-        return "rotate=off"
-    if deg == 180:
-        return "rotate=180 (upside down)"
-    if deg == 270:
-        return "rotate=270 CCW"
-    if deg == 90:
-        return "rotate=90 CW"
-    return f"rotate={deg}"
+def orient_from_dict(
+    data: dict,
+    rotate_deg: int,
+    flip_ud: bool,
+    *,
+    apply_rotate: bool = True,
+    apply_flip: bool = True,
+) -> tuple[int, bool]:
+    """Merge saved plane.json orient into current values (CLI can skip either)."""
+    rd, fu = rotate_deg, flip_ud
+    if apply_rotate and "rotate_deg" in data:
+        rd = int(data["rotate_deg"])
+    if apply_flip and "flip_ud" in data:
+        fu = bool(data["flip_ud"])
+    elif apply_flip and apply_rotate and int(data.get("rotate_deg", rd)) == 180:
+        fu = True
+    return normalize_orient(rd, fu)
+
+
+def orient_frame(
+    frame: np.ndarray,
+    rotate_deg: int,
+    flip_ud: bool = False,
+) -> np.ndarray:
+    """Apply sideways rotate (0/90/270), then optional upside-down 180°."""
+    rd, fu = normalize_orient(rotate_deg, flip_ud)
+    out = frame
+    if rd == 270:
+        # Sideways helper: skip if the driver already delivers portrait.
+        if not (cfg.CAMERAS_SIDEWAYS and out.shape[0] >= out.shape[1]):
+            out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rd == 90:
+        if not (cfg.CAMERAS_SIDEWAYS and out.shape[0] >= out.shape[1]):
+            out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+    if fu:
+        out = cv2.rotate(out, cv2.ROTATE_180)
+    return out
+
+
+def rotate_label(deg: int, flip_ud: bool = False) -> str:
+    rd, fu = normalize_orient(deg, flip_ud)
+    if rd == 0:
+        base = "rotate=off"
+    elif rd == 270:
+        base = "rotate=270 CCW"
+    elif rd == 90:
+        base = "rotate=90 CW"
+    else:
+        base = f"rotate={rd}"
+    return f"{base} flip={'ON' if fu else 'off'}"
 
 
 def draw_camera_hud(
@@ -550,8 +581,9 @@ def draw_camera_hud(
     which_cam: str,
     rotate_deg: int,
     show_north: bool = True,
+    flip_ud: bool = False,
 ) -> None:
-    """L/R badge; optional N at TOP (sky) when aligning / checking rotate."""
+    """L/R badge; optional N at TOP (sky) when aligning / checking orient."""
     col = COL_POST if which_cam == "L" else COL_CLICK_NEAR
     put_label(img, "L" if which_cam == "L" else "R", (8, 26), col, 0.75, 2)
     h, w = img.shape[:2]
@@ -560,8 +592,15 @@ def draw_camera_hud(
         cv2.arrowedLine(img, (cx, 36), (cx, 10), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
         put_label(img, "N", (cx - 10, 58), (0, 255, 255), 0.7, 2)
         put_label(img, "up/sky", (cx - 28, 76), (180, 255, 255), 0.4, 1)
-    if h < w:
-        put_label(img, "O rotate", (8, h - 14), (0, 0, 255), 0.5, 2)
+    if show_north:
+        put_label(
+            img,
+            f"flip={'ON' if flip_ud else 'off'}",
+            (8, h - 14),
+            (0, 0, 255) if h < w else (0, 200, 255),
+            0.45,
+            2,
+        )
 
 
 def load_still(path: Path) -> np.ndarray:
@@ -1445,6 +1484,7 @@ def save_plane(
     roll_r: float = 0.0,
     snap_l: np.ndarray | None = None,
     snap_r: np.ndarray | None = None,
+    flip_ud: bool = False,
 ) -> None:
     PLANE_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1466,6 +1506,7 @@ def save_plane(
         "image_height": img_h,
         "cameras_sideways": cfg.CAMERAS_SIDEWAYS,
         "rotate_deg": rotate_deg,
+        "flip_ud": bool(flip_ud),
         "plane": {
             "origin": "midpoint of crossbar on the goal plane",
             "equation": "Z = 0 (goal plane / posts / crossbar)",
@@ -1539,6 +1580,16 @@ def main() -> int:
         help="Rotate landscape frames: 90=CW, 270=CCW, 0=off "
              f"(default {cfg.SIDEWAYS_ROTATE_DEG} from stereo_config)",
     )
+    flip_grp = parser.add_mutually_exclusive_group()
+    flip_grp.add_argument(
+        "--flip", dest="flip", action="store_true",
+        help="Force upside-down flip ON",
+    )
+    flip_grp.add_argument(
+        "--no-flip", dest="flip", action="store_false",
+        help="Force upside-down flip OFF",
+    )
+    parser.set_defaults(flip=None)
     parser.add_argument(
         "--model", type=str, default=None,
         help="Ball detector. Default: models/football_yolov8n.pt if present, else yolov8n.pt",
@@ -1607,8 +1658,8 @@ def main() -> int:
         print("ERROR: --behind must be >= 0", file=sys.stderr)
         return 1
     rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
-    if rotate_deg not in (0, 90, 270):
-        rotate_deg = 90
+    flip_ud = bool(args.flip) if args.flip is not None else bool(cfg.FLIP_UD)
+    rotate_deg, flip_ud = normalize_orient(rotate_deg, flip_ud)
     clicks = ClickState()
     snap_l: np.ndarray | None = None
     snap_r: np.ndarray | None = None
@@ -1699,23 +1750,21 @@ def main() -> int:
                 print("ERROR: could not read initial frames.", file=sys.stderr)
                 return 1
 
-        view_probe_l = orient_frame(probe_l, rotate_deg)
-        view_probe_r = orient_frame(probe_r, rotate_deg)
+        view_probe_l = orient_frame(probe_l, rotate_deg, flip_ud=flip_ud)
+        view_probe_r = orient_frame(probe_r, rotate_deg, flip_ud=flip_ud)
         img_w, img_h = view_probe_l.shape[1], view_probe_l.shape[0]
         img_w_r, img_h_r = view_probe_r.shape[1], view_probe_r.shape[0]
         raw_l_wh = (probe_l.shape[1], probe_l.shape[0])
         raw_r_wh = (probe_r.shape[1], probe_r.shape[0])
+        print(f"  Orient: {rotate_label(rotate_deg, flip_ud)}")
         if raw_l_wh != (img_w, img_h) or raw_r_wh != (img_w_r, img_h_r):
             print(
-                f"  Oriented landscape → portrait ({rotate_label(rotate_deg)}): "
+                f"  Landscape → portrait: "
                 f"L {raw_l_wh[0]}×{raw_l_wh[1]}→{img_w}×{img_h}  "
                 f"R {raw_r_wh[0]}×{raw_r_wh[1]}→{img_w_r}×{img_h_r}"
             )
         elif rotate_deg and cfg.CAMERAS_SIDEWAYS:
-            print(
-                f"  Frames already portrait — no rotate applied "
-                f"(O still cycles {rotate_label(rotate_deg)})"
-            )
+            print("  Frames already portrait — sideways rotate skipped (O/U still work)")
         if (img_w, img_h) != (img_w_r, img_h_r):
             print(
                 f"WARNING: left is {img_w}×{img_h}, right is {img_w_r}×{img_h_r}. "
@@ -1794,8 +1843,8 @@ def main() -> int:
                 time.sleep(0.02)
                 continue
 
-            view_l = orient_frame(frame_l, rotate_deg)
-            view_r = orient_frame(frame_r, rotate_deg)
+            view_l = orient_frame(frame_l, rotate_deg, flip_ud=flip_ud)
+            view_r = orient_frame(frame_r, rotate_deg, flip_ud=flip_ud)
             img_w, img_h = view_l.shape[1], view_l.shape[0]
             img_w_r, img_h_r = view_r.shape[1], view_r.shape[0]
             if args.focal is not None:
@@ -1875,8 +1924,8 @@ def main() -> int:
             else:
                 ball_dets = (None, None)
 
-            draw_camera_hud(disp_l, "L", rotate_deg)
-            draw_camera_hud(disp_r, "R", rotate_deg)
+            draw_camera_hud(disp_l, "L", rotate_deg, flip_ud=flip_ud)
+            draw_camera_hud(disp_r, "R", rotate_deg, flip_ud=flip_ud)
 
             combo, panel_split_x = side_by_side_full(disp_l, disp_r)
             color, banner, pulse = call_style(ball_call)
@@ -1893,7 +1942,7 @@ def main() -> int:
                 f"L {src_l}  R {src_r}  |  posts {baseline:.2f}m  "
                 f"ball Ø{cfg.BALL_DIAMETER_M*100:.0f}cm  "
                 f"HL{h_left:.0f} HR{h_right:.0f} V{v_angle:.0f}  visY≥{y_vis:.2f}m  "
-                f"{fps_ema:.0f}fps  {rotate_label(rotate_deg)}{src_note}",
+                f"{fps_ema:.0f}fps  {rotate_label(rotate_deg, flip_ud)}{src_note}",
             ]
             if ball_line:
                 lines.append(ball_line)
@@ -2057,6 +2106,15 @@ def main() -> int:
             elif key in (ord("d"), ord("D")):
                 show_labels = not show_labels
                 print(f"  Landmark distance labels {'ON' if show_labels else 'OFF'}")
+            elif key in (ord("u"), ord("U")):
+                flip_ud = not flip_ud
+                clicks.clear()
+                snap_l = snap_r = None
+                ball_dets = (None, None)
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
+                print(f"  {rotate_label(rotate_deg, flip_ud)}  (clicks cleared)")
             elif key in (ord("o"), ord("O")):
                 rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
                 clicks.clear()
@@ -2065,7 +2123,7 @@ def main() -> int:
                 ball_sched.reset()
                 motion_l.reset()
                 motion_r.reset()
-                print(f"  {rotate_label(rotate_deg)}  (clicks cleared)")
+                print(f"  {rotate_label(rotate_deg, flip_ud)}  (clicks cleared)")
             elif key in (ord("s"), ord("S")):
                 save_plane(
                     baseline, behind, abs(h_left), v_angle, extend_up,
@@ -2073,6 +2131,7 @@ def main() -> int:
                     h_left=h_left, h_right=h_right,
                     v_left=v_angle, v_right=v_angle,
                     snap_l=snap_l, snap_r=snap_r,
+                    flip_ud=flip_ud,
                 )
             elif key in (ord("l"), ord("L")):
                 data = load_plane()
@@ -2087,13 +2146,11 @@ def main() -> int:
                     xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
                     pos_l = np.array(xyz_l)
                     pos_r = np.array(xyz_r)
-                    rd = int(data.get("rotate_deg", rotate_deg))
-                    if rd in (0, 90, 270) and rd != rotate_deg:
-                        rotate_deg = rd
-                        ball_dets = (None, None)
-                        ball_sched.reset()
-                        motion_l.reset()
-                        motion_r.reset()
+                    rotate_deg, flip_ud = orient_from_dict(data, rotate_deg, flip_ud)
+                    ball_dets = (None, None)
+                    ball_sched.reset()
+                    motion_l.reset()
+                    motion_r.reset()
                     clicks.load_dict(data.get("clicks", {}))
                     sl = data.get("overlay_snap_left")
                     sr = data.get("overlay_snap_right")
@@ -2101,7 +2158,8 @@ def main() -> int:
                     snap_r = None if sr is None else np.array(sr, dtype=np.float64)
                     print(
                         f"  Loaded {PLANE_PATH}  HL={h_left:.1f} HR={h_right:.1f} "
-                        f"V={v_angle:.1f}  behind={behind:.3f} m  {rotate_label(rotate_deg)}"
+                        f"V={v_angle:.1f}  behind={behind:.3f} m  "
+                        f"{rotate_label(rotate_deg, flip_ud)}"
                     )
 
     except RuntimeError as e:

@@ -77,6 +77,8 @@ CAMERAS_SIDEWAYS: bool = True
 # 90 = clockwise, 270 = counter-clockwise, 0 = do not rotate.
 # Skip when the frame is already portrait (h >= w).
 SIDEWAYS_ROTATE_DEG: int = 90
+# Rig mounted upside-down → swap top↔bottom after sideways rotate.
+FLIP_UD: bool = True
 
 # FOV in the CAPTURED image (swapped vs datasheet because of sideways mount)
 HFOV_DEG: float = DATASHEET_VFOV_DEG   # ≈47.3° left–right in image
@@ -164,7 +166,8 @@ def print_summary(
         f"(70° is UP–DOWN)\n"
         f"  Native res: {NATIVE_WIDTH}×{NATIVE_HEIGHT} px  (portrait after rotate)\n"
         f"  Rotate    : {SIDEWAYS_ROTATE_DEG}° "
-        f"{'(skip if already portrait)' if CAMERAS_SIDEWAYS else '(disabled)'}\n"
+        f"{'(skip if already portrait)' if CAMERAS_SIDEWAYS else '(disabled)'}  "
+        f"flip_ud={'ON' if FLIP_UD else 'off'}\n"
         f"  Baseline  : {BASELINE_M:.3f} m  (lens to lens)\n"
         f"  Behind    : {behind:.3f} m  (lens behind post face; plane at Z=0)\n"
         f"  H-angle   : {H_ANGLE_DEG:.1f}°  (across goal → far post)\n"

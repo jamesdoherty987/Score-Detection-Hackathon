@@ -39,6 +39,7 @@
   "image_height": 640,
   "cameras_sideways": true,
   "rotate_deg": 90,
+  "flip_ud": true,
   "plane": {
     "origin": "midpoint of crossbar on the goal plane",
     "equation": "Z = 0 (goal plane / posts / crossbar)",

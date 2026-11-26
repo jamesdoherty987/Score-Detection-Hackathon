@@ -24,13 +24,15 @@ Keys
   B           Toggle ball detection
   D           Toggle verbose dbg line
   C / K       Clear clicks / re-snap (Align)
-  O / R / S / L   rotate / reset / save / load
+  O / F       Cycle sideways rotate / toggle upside-down flip
+  R / S / L   reset / save / load
   Q / Esc     Quit
 
 Usage
 ─────
-  python capture/score_live.py --left 2 --right 1
-  python capture/score_live.py --left 0 --right 1 --imgsz 256
+  python capture/score_live.py --left /dev/video4 --right /dev/video1
+  python capture/score_live.py --left /dev/video4 --right /dev/video1 --slow-demo
+  python capture/score_live.py --no-flip          # if cameras are right-side up
 """
 
 from __future__ import annotations
@@ -121,11 +123,9 @@ PI_CAM_W, PI_CAM_H = 640, 480
 PI_REPLAY_S = 5.0
 PI_REPLAY_SCALE = 0.35
 
-# Hand-held / Pi: small YOLO, moderate stride (raise stride if the Pi struggles).
+# Hand-held / Pi: small YOLO, moderate stride (raise --every if the Pi struggles).
 SLOW_IMGSZ = 192
 SLOW_YOLO_STRIDE = 6
-SLOW_SEARCH_STRIDE = 3
-SLOW_NEAR_STRIDE = 2
 SLOW_STALE_FRAMES = 30
 # Keep 640x480 MJPEG (proven with OV9281); lower res can pick a bad UVC mode.
 SLOW_CAM_W, SLOW_CAM_H = 640, 480
@@ -288,9 +288,24 @@ def main() -> int:
         "--rotate",
         type=int,
         default=None,
-        choices=(0, 90, 180, 270),
-        help="0=off, 180=upside down, 90/270=sideways mount",
+        choices=(0, 90, 270),
+        help="Sideways rotate: 0=off, 90=CW, 270=CCW "
+             f"(default {cfg.SIDEWAYS_ROTATE_DEG}; skipped if already portrait)",
     )
+    flip_grp = parser.add_mutually_exclusive_group()
+    flip_grp.add_argument(
+        "--flip",
+        dest="flip",
+        action="store_true",
+        help="Force upside-down flip ON (default from stereo_config.FLIP_UD)",
+    )
+    flip_grp.add_argument(
+        "--no-flip",
+        dest="flip",
+        action="store_false",
+        help="Force upside-down flip OFF",
+    )
+    parser.set_defaults(flip=None)
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--conf", type=float, default=plane.CONFIDENCE)
     parser.add_argument(
@@ -379,9 +394,11 @@ def main() -> int:
     h_left = float(args.h_angle)
     h_right = -float(args.h_angle)
     v_angle = float(args.v_angle)
-    rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
-    if rotate_deg not in (0, 90, 180, 270):
-        rotate_deg = 90
+    rotate_cli = args.rotate is not None
+    flip_cli = args.flip is not None
+    rotate_deg = int(args.rotate) if rotate_cli else int(cfg.SIDEWAYS_ROTATE_DEG)
+    flip_ud = bool(args.flip) if flip_cli else bool(cfg.FLIP_UD)
+    rotate_deg, flip_ud = plane.normalize_orient(rotate_deg, flip_ud)
     yolo_imgsz = max(128, int(args.imgsz))
     yolo_device = str(args.device)
     motion_gate = not bool(args.no_motion_gate)
@@ -488,8 +505,39 @@ def main() -> int:
             f"({cap_l.stats()} | {cap_r.stats()})"
         )
 
-        view_l = plane.orient_frame(probe_l, rotate_deg)
-        view_r = plane.orient_frame(probe_r, rotate_deg)
+        xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
+        pos_l = np.array(xyz_l)
+        pos_r = np.array(xyz_r)
+
+        data = plane.load_plane()
+        if data is not None:
+            h_left = float(data.get("h_left_deg", data.get("h_angle_deg", h_left)))
+            h_right = float(data.get("h_right_deg", -abs(h_left)))
+            v_angle = float(data.get("v_angle_deg", v_angle))
+            extend_up = float(data.get("extend_up_m", extend_up))
+            behind = float(data.get("cam_behind_post_m", behind))
+            xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
+            pos_l = np.array(xyz_l)
+            pos_r = np.array(xyz_r)
+            # CLI --rotate / --flip|--no-flip each win over plane.json for that field.
+            rotate_deg, flip_ud = plane.orient_from_dict(
+                data, rotate_deg, flip_ud,
+                apply_rotate=not rotate_cli,
+                apply_flip=not flip_cli,
+            )
+            clicks.load_dict(data.get("clicks", {}))
+            sl = data.get("overlay_snap_left")
+            sr = data.get("overlay_snap_right")
+            snap_l = None if sl is None else np.array(sl, dtype=np.float64)
+            snap_r = None if sr is None else np.array(sr, dtype=np.float64)
+            if snap_l is not None and snap_r is not None:
+                mode = Mode.PLAY
+                print(f"  Loaded snaps → PLAY  ({plane.PLANE_PATH.name})")
+            else:
+                print(f"  Loaded {plane.PLANE_PATH.name} — finish Align")
+
+        view_l = plane.orient_frame(probe_l, rotate_deg, flip_ud=flip_ud)
+        view_r = plane.orient_frame(probe_r, rotate_deg, flip_ud=flip_ud)
         img_w, img_h = view_l.shape[1], view_l.shape[0]
         img_w_r, img_h_r = view_r.shape[1], view_r.shape[0]
         if args.focal is not None:
@@ -503,42 +551,15 @@ def main() -> int:
         print(
             "ALIGN: BOT→TOP far post on L, then R → Enter PLAY.\n"
             f"imgsz={yolo_imgsz}  device={yolo_device}  "
-            f"replay={replay_s:.0f}s@{replay_scale:.0%}  D=verbose dbg\n"
+            f"{plane.rotate_label(rotate_deg, flip_ud)}  "
+            f"(F=flip, O=rotate)\n"
         )
-
-        xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
-        pos_l = np.array(xyz_l)
-        pos_r = np.array(xyz_r)
 
         def build_projs():
             return (
                 make_proj_matrix(pos_l, h_left, v_angle, focal_px, img_w, img_h),
                 make_proj_matrix(pos_r, h_right, v_angle, focal_r, img_w_r, img_h_r),
             )
-
-        data = plane.load_plane()
-        if data is not None:
-            h_left = float(data.get("h_left_deg", data.get("h_angle_deg", h_left)))
-            h_right = float(data.get("h_right_deg", -abs(h_left)))
-            v_angle = float(data.get("v_angle_deg", v_angle))
-            extend_up = float(data.get("extend_up_m", extend_up))
-            behind = float(data.get("cam_behind_post_m", behind))
-            xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
-            pos_l = np.array(xyz_l)
-            pos_r = np.array(xyz_r)
-            rd = int(data.get("rotate_deg", rotate_deg))
-            if rd in (0, 90, 180, 270):
-                rotate_deg = rd
-            clicks.load_dict(data.get("clicks", {}))
-            sl = data.get("overlay_snap_left")
-            sr = data.get("overlay_snap_right")
-            snap_l = None if sl is None else np.array(sl, dtype=np.float64)
-            snap_r = None if sr is None else np.array(sr, dtype=np.float64)
-            if snap_l is not None and snap_r is not None:
-                mode = Mode.PLAY
-                print(f"  Loaded snaps → PLAY  ({plane.PLANE_PATH.name})")
-            else:
-                print(f"  Loaded {plane.PLANE_PATH.name} — finish Align")
 
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW, 1400, 900)
@@ -564,8 +585,8 @@ def main() -> int:
                 frame_l = _grow_to(small_l, raw_wh_l)
                 frame_r = _grow_to(small_r, raw_wh_r)
 
-            view_l = plane.orient_frame(frame_l, rotate_deg)
-            view_r = plane.orient_frame(frame_r, rotate_deg)
+            view_l = plane.orient_frame(frame_l, rotate_deg, flip_ud=flip_ud)
+            view_r = plane.orient_frame(frame_r, rotate_deg, flip_ud=flip_ud)
             img_w, img_h = view_l.shape[1], view_l.shape[0]
             img_w_r, img_h_r = view_r.shape[1], view_r.shape[0]
             if args.focal is not None:
@@ -642,8 +663,8 @@ def main() -> int:
                     last_event_call = ball_call
 
             show_n = mode == Mode.ALIGN
-            plane.draw_camera_hud(disp_l, "L", rotate_deg, show_north=show_n)
-            plane.draw_camera_hud(disp_r, "R", rotate_deg, show_north=show_n)
+            plane.draw_camera_hud(disp_l, "L", rotate_deg, show_north=show_n, flip_ud=flip_ud)
+            plane.draw_camera_hud(disp_r, "R", rotate_deg, show_north=show_n, flip_ud=flip_ud)
             combo, panel_split_x = plane.side_by_side_full(disp_l, disp_r)
 
             color, banner, pulse = plane.call_style(ball_call)
@@ -811,8 +832,8 @@ def main() -> int:
                     snap_l, snap_r, _ = _try_snap(
                         "R", clicks, P1, P2, baseline, extend_up, snap_l, snap_r,
                     )
-            elif key in (ord("o"), ord("O")):
-                rotate_deg = {90: 180, 180: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
+            elif key in (ord("f"), ord("F")):
+                flip_ud = not flip_ud
                 clicks.clear()
                 snap_l = snap_r = None
                 ball_dets = (None, None)
@@ -820,7 +841,17 @@ def main() -> int:
                 motion_l.reset()
                 motion_r.reset()
                 mode = Mode.ALIGN
-                print(f"  {plane.rotate_label(rotate_deg)} → ALIGN")
+                print(f"  {plane.rotate_label(rotate_deg, flip_ud)} → ALIGN")
+            elif key in (ord("o"), ord("O")):
+                rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
+                clicks.clear()
+                snap_l = snap_r = None
+                ball_dets = (None, None)
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
+                mode = Mode.ALIGN
+                print(f"  {plane.rotate_label(rotate_deg, flip_ud)} → ALIGN")
             elif key in (ord("r"), ord("R")):
                 h_left = float(cfg.H_ANGLE_DEG)
                 h_right = -float(cfg.H_ANGLE_DEG)
@@ -836,6 +867,7 @@ def main() -> int:
                     h_left=h_left, h_right=h_right,
                     v_left=v_angle, v_right=v_angle,
                     snap_l=snap_l, snap_r=snap_r,
+                    flip_ud=flip_ud,
                 )
             elif key in (ord("l"), ord("L")):
                 data = plane.load_plane()
@@ -850,15 +882,13 @@ def main() -> int:
                     xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
                     pos_l = np.array(xyz_l)
                     pos_r = np.array(xyz_r)
-                    rd = int(data.get("rotate_deg", rotate_deg))
-                    if rd in (0, 90, 180, 270):
-                        rotate_deg = rd
+                    rotate_deg, flip_ud = plane.orient_from_dict(data, rotate_deg, flip_ud)
                     clicks.load_dict(data.get("clicks", {}))
                     sl = data.get("overlay_snap_left")
                     sr = data.get("overlay_snap_right")
                     snap_l = None if sl is None else np.array(sl, dtype=np.float64)
                     snap_r = None if sr is None else np.array(sr, dtype=np.float64)
-                    print(f"  Loaded {plane.PLANE_PATH.name}")
+                    print(f"  Loaded {plane.PLANE_PATH.name}  ({plane.rotate_label(rotate_deg, flip_ud)})")
 
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
