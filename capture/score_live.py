@@ -60,12 +60,12 @@ PI_CAM_W, PI_CAM_H = 640, 480
 PI_REPLAY_S = 5.0
 PI_REPLAY_SCALE = 0.35
 
-# Hand-held slow demo (Pi): tiny YOLO, rare runs — fine if the ball barely moves.
-SLOW_IMGSZ = 160
-SLOW_YOLO_STRIDE = 16
-SLOW_SEARCH_STRIDE = 8
-SLOW_NEAR_STRIDE = 5
-SLOW_STALE_FRAMES = 40
+# Hand-held / Pi: small YOLO, moderate stride (raise stride if the Pi struggles).
+SLOW_IMGSZ = 192
+SLOW_YOLO_STRIDE = 6
+SLOW_SEARCH_STRIDE = 3
+SLOW_NEAR_STRIDE = 2
+SLOW_STALE_FRAMES = 30
 # Keep 640x480 MJPEG (proven with OV9281); lower res can pick a bad UVC mode.
 SLOW_CAM_W, SLOW_CAM_H = 640, 480
 SLOW_REPLAY_S = 4.0
@@ -236,7 +236,13 @@ def main() -> int:
         "--yolo-stride",
         type=int,
         default=plane.IDLE_YOLO_STRIDE,
-        help=f"Deep-field YOLO every N frames (default {plane.IDLE_YOLO_STRIDE})",
+        help=f"Deep-field YOLO every N frames (default {plane.IDLE_YOLO_STRIDE}; lower = more often)",
+    )
+    parser.add_argument(
+        "--near-stride",
+        type=int,
+        default=None,
+        help="YOLO every N frames near the posts (default 1, or 2 with --slow-demo)",
     )
     parser.add_argument("--device", type=str, default=plane.YOLO_DEVICE, help="YOLO device (cpu or 0)")
     parser.add_argument("--replay-s", type=float, default=None)
@@ -320,7 +326,11 @@ def main() -> int:
     motion_gate = not bool(args.no_motion_gate)
     replay_s = max(2.0, float(args.replay_s))
     search_stride = SLOW_SEARCH_STRIDE if slow else plane.SEARCH_STRIDE
-    near_stride = SLOW_NEAR_STRIDE if slow else plane.NEAR_STRIDE
+    near_stride = (
+        int(args.near_stride)
+        if args.near_stride is not None
+        else (SLOW_NEAR_STRIDE if slow else plane.NEAR_STRIDE)
+    )
     stale_frames = SLOW_STALE_FRAMES if slow else plane.STALE_DET_FRAMES
 
     clicks = plane.ClickState()
