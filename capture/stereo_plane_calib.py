@@ -255,37 +255,40 @@ def open_camera(
 def list_working_cameras(
     width: int | None = None,
     height: int | None = None,
-) -> list[str]:
+) -> list[tuple[str, str]]:
     """
-    Return capture camera nodes (usually the two OV9281 /dev/videoN paths).
+    Return [(device, hint), ...] for capture nodes (no open — avoids V4L2 hangs).
 
-    Does not open devices (opening can V4L2-timeout on the Pi). Prefers
-    by-path capture links; falls back to by-id, then bare /dev/video*.
+    Prefer by-path. If by-id names look like Arducam/OV9281, keep only those
+    (drops a random laptop/Pi webcam when three nodes show up).
     """
-    _ = (width, height)  # kept so callers can pass cam size without changing API
-    found: list[str] = []
-    seen: set[str] = set()
+    _ = (width, height)
+    # device -> best hint
+    info: dict[str, str] = {}
 
-    def _add(device: str) -> None:
-        if not device or device in seen:
-            return
-        if not Path(device).exists():
-            return
-        seen.add(device)
-        found.append(device)
+    def _hint(r: dict[str, str]) -> str:
+        name = r.get("name") or ""
+        # by-path: ...-usb-0:1.2:1.0-video-index0 → usb-0:1.2
+        if r.get("kind") == "by-path" and "usb-" in name:
+            part = name.split("usb-", 1)[-1]
+            part = part.split("-video", 1)[0]
+            return f"usb-{part}"
+        if r.get("kind") == "by-id":
+            return name[:48]
+        return r.get("kind") or ""
 
     rows = list_linux_camera_links()
-    # Prefer by-path (stable USB port), then by-id.
     for kind in ("by-path", "by-id"):
         for r in rows:
             if r["kind"] != kind or r["role"] != "capture":
                 continue
             device = r.get("device") or ""
-            if device.startswith("/dev/video"):
-                _add(device)
+            if not device.startswith("/dev/video") or not Path(device).exists():
+                continue
+            if device not in info or kind == "by-path":
+                info[device] = _hint(r)
 
-    if not found:
-        # Last resort: every /dev/videoN that isn't tagged metadata.
+    if not info:
         meta = {
             r["device"]
             for r in rows
@@ -294,9 +297,19 @@ def list_working_cameras(
         for i in range(16):
             dev = f"/dev/video{i}"
             if Path(dev).exists() and dev not in meta:
-                _add(dev)
+                info[dev] = ""
 
-    return found
+    items = sorted(info.items(), key=lambda kv: kv[0])
+
+    # If we can spot the stereo pair by name, drop other webcams.
+    stereoish = [
+        (d, h) for d, h in items
+        if any(tok in (h + d).lower() for tok in ("arducam", "ov9281", "b0332", "ln013"))
+    ]
+    if len(stereoish) >= 2:
+        return stereoish
+
+    return items
 
 def read_cam(
     cap: cv2.VideoCapture,

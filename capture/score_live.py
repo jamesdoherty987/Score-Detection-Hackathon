@@ -371,8 +371,14 @@ def main() -> int:
         if not cams:
             print("No cameras found under /dev/v4l or /dev/video*.", file=sys.stderr)
             return 1
-        for name in cams:
-            print(name)
+        for device, hint in cams:
+            print(f"{device}  {hint}".rstrip())
+        if len(cams) > 2:
+            print(
+                "\nPick the two stereo cams (same Arducam/OV9281 USB pair).\n"
+                "Tip: unplug one goal cam, run --list again — the missing line is that cam.",
+                file=sys.stderr,
+            )
         return 0
 
     if str(args.left).strip() == str(args.right).strip():
