@@ -486,11 +486,16 @@ def main() -> int:
         ae_l: SoftwareAutoExposure | None = None
         ae_r: SoftwareAutoExposure | None = None
         if use_ae:
-            print("\nPer-camera auto-exposure (independent L/R)...")
+            print("\nPer-camera auto-exposure (hardware only — no tone-map, keeps YOLO clean)...")
             ae_l = SoftwareAutoExposure(raw_l)
             ae_l.settle(lock=False, loops=AE_SETTLE_LOOPS_LIVE, label="L")
             ae_r = SoftwareAutoExposure(raw_r)
             ae_r.settle(lock=False, loops=AE_SETTLE_LOOPS_LIVE, label="R")
+            # Software darkening crushed ball contrast; drive exposure/gain only.
+            ae_l.software_enabled = False
+            ae_r.software_enabled = False
+            ae_l.software_compensation = 1.0
+            ae_r.software_compensation = 1.0
             print(f"  L {ae_l.status_text()}")
             print(f"  R {ae_r.status_text()}")
         else:
@@ -510,9 +515,9 @@ def main() -> int:
             return 1
         probe_l, probe_r = live_l, live_r
         if ae_l is not None:
-            probe_l = ae_l.process(probe_l)
+            ae_l.update(probe_l)
         if ae_r is not None:
-            probe_r = ae_r.process(probe_r)
+            ae_r.update(probe_r)
         raw_wh_l = (probe_l.shape[1], probe_l.shape[0])
         raw_wh_r = (probe_r.shape[1], probe_r.shape[0])
         print(
@@ -588,11 +593,11 @@ def main() -> int:
                     time.sleep(0.01)
                     continue
                 frame_l, frame_r = next_l, next_r
-                # Independent L/R exposure: each meters its own ball-path band.
+                # Per-cam HW exposure/gain only (no software tone-map — that hurt YOLO).
                 if ae_l is not None:
-                    frame_l = ae_l.process(frame_l)
+                    ae_l.update(frame_l)
                 if ae_r is not None:
-                    frame_r = ae_r.process(frame_r)
+                    ae_r.update(frame_r)
                 raw_wh_l = (frame_l.shape[1], frame_l.shape[0])
                 raw_wh_r = (frame_r.shape[1], frame_r.shape[0])
             else:

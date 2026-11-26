@@ -154,6 +154,8 @@ class SoftwareAutoExposure:
         self.locked = False
         self.hardware_controls = True
         self.software_compensation = SOFTWARE_COMP_MAX
+        # When False, only drive camera exposure/gain (no tone-map). Prefer for YOLO.
+        self.software_enabled = True
         self._last_hw_adjust_brightness: float | None = None
         self._hw_stuck_count = 0
 
@@ -275,7 +277,7 @@ class SoftwareAutoExposure:
 
     def apply(self, frame):
         """Return frame with software tone mapping applied."""
-        if self.software_compensation >= 0.999:
+        if not self.software_enabled or self.software_compensation >= 0.999:
             return frame
 
         # Linear scale works even when the sensor has clipped to pure white.
@@ -381,17 +383,21 @@ class SoftwareAutoExposure:
         raw_brightness = frame_brightness(frame)
         self.last_raw_brightness = raw_brightness
 
-        if raw_brightness > TARGET_BRIGHTNESS + BRIGHTNESS_TOLERANCE:
-            if self.software_compensation >= 0.95:
-                instant = TARGET_BRIGHTNESS / raw_brightness
-                self.software_compensation = float(
-                    np.clip(instant, SOFTWARE_COMP_MIN, SOFTWARE_COMP_MAX)
-                )
+        if self.software_enabled:
+            if raw_brightness > TARGET_BRIGHTNESS + BRIGHTNESS_TOLERANCE:
+                if self.software_compensation >= 0.95:
+                    instant = TARGET_BRIGHTNESS / raw_brightness
+                    self.software_compensation = float(
+                        np.clip(instant, SOFTWARE_COMP_MIN, SOFTWARE_COMP_MAX)
+                    )
 
-        output_brightness = raw_brightness * self.software_compensation
-        self.last_brightness = output_brightness
-        self._adjust_software(raw_brightness, output_brightness)
-        self.last_brightness = raw_brightness * self.software_compensation
+            output_brightness = raw_brightness * self.software_compensation
+            self.last_brightness = output_brightness
+            self._adjust_software(raw_brightness, output_brightness)
+            self.last_brightness = raw_brightness * self.software_compensation
+        else:
+            self.software_compensation = SOFTWARE_COMP_MAX
+            self.last_brightness = raw_brightness
 
         raw_error = raw_brightness - TARGET_BRIGHTNESS
         if not self.hardware_controls or abs(raw_error) <= BRIGHTNESS_TOLERANCE:
