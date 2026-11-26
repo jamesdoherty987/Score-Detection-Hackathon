@@ -203,30 +203,97 @@ def _fourcc_to_str(code: float | int) -> str:
     return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4))
 
 
-def _linux_capture_targets(index: int) -> list[tuple[str, object, int]]:
-    """
-    Linux/Pi: open the real V4L2 capture node only.
-    Prefer /dev/videoN path + CAP_V4L2 — never CAP_ANY (it can hit metadata nodes).
-    """
-    targets: list[tuple[str, object, int]] = []
-    dev = f"/dev/video{int(index)}"
-    if Path(dev).exists():
-        targets.append((f"V4L2 {dev}", dev, cv2.CAP_V4L2))
-    # Index + V4L2 only (same node when udev numbering matches).
-    targets.append((f"V4L2 index {int(index)}", int(index), cv2.CAP_V4L2))
-    return targets
+def _is_capture_symlink_name(name: str) -> bool:
+    """UVC capture nodes are usually *-video-index0; index1+ are often metadata."""
+    lower = name.lower()
+    if "index0" in lower:
+        return True
+    if "index" in lower:
+        return False
+    return True
 
 
-def _open_targets(index: int) -> list[tuple[str, object, int]]:
-    s = platform.system()
-    if s == "Linux":
-        return _linux_capture_targets(index)
-    if s == "Darwin":
-        return [("AVFoundation", int(index), cv2.CAP_AVFOUNDATION)]
-    return [
-        ("MSMF", int(index), cv2.CAP_MSMF),
-        ("DirectShow", int(index), cv2.CAP_DSHOW),
+def list_linux_camera_links() -> list[dict[str, str]]:
+    """Stable udev links under /dev/v4l/by-id and by-path (Linux/Pi)."""
+    rows: list[dict[str, str]] = []
+    if platform.system() != "Linux":
+        return rows
+    for kind in ("by-id", "by-path"):
+        root = Path("/dev/v4l") / kind
+        if not root.is_dir():
+            continue
+        for link in sorted(root.iterdir()):
+            try:
+                target = str(link.resolve())
+            except OSError:
+                continue
+            rows.append(
+                {
+                    "kind": kind,
+                    "name": link.name,
+                    "link": str(link),
+                    "device": target,
+                    "role": "capture" if _is_capture_symlink_name(link.name) else "metadata?",
+                }
+            )
+    return rows
+
+
+def resolve_camera_source(spec: str | int) -> tuple[str, object, int]:
+    """
+    Resolve a camera spec to (label, OpenCV source, backend).
+
+    Accepts:
+      0, "0"                         → /dev/video0 (Linux) or index
+      /dev/video2                     → that node
+      /dev/v4l/by-id/...              → stable serial/name link
+      /dev/v4l/by-path/...            → stable USB-port link (best for identical cams)
+      substring of a by-id/by-path name (must match exactly one capture link)
+    """
+    raw = str(spec).strip()
+    system = platform.system()
+
+    if system != "Linux":
+        if raw.isdigit():
+            idx = int(raw)
+            if system == "Darwin":
+                return (f"AVFoundation {idx}", idx, cv2.CAP_AVFOUNDATION)
+            return (f"MSMF {idx}", idx, cv2.CAP_MSMF)
+        raise RuntimeError(f"Camera path specs are Linux-only; got {raw!r}")
+
+    # Explicit device node or udev link.
+    if raw.startswith("/dev/"):
+        path = Path(raw)
+        if not path.exists():
+            raise RuntimeError(f"Camera device not found: {raw}")
+        return (f"V4L2 {raw}", str(path), cv2.CAP_V4L2)
+
+    # Numeric index → prefer /dev/videoN path (capture node you asked for).
+    if raw.isdigit():
+        idx = int(raw)
+        dev = f"/dev/video{idx}"
+        if Path(dev).exists():
+            return (f"V4L2 {dev}", dev, cv2.CAP_V4L2)
+        return (f"V4L2 index {idx}", idx, cv2.CAP_V4L2)
+
+    # Substring match against stable links (capture nodes only).
+    links = [
+        r for r in list_linux_camera_links()
+        if r["role"] == "capture" and raw.lower() in r["name"].lower()
     ]
+    # Prefer by-id when both match.
+    links.sort(key=lambda r: (0 if r["kind"] == "by-id" else 1, r["name"]))
+    if not links:
+        raise RuntimeError(
+            f"No capture camera matching {raw!r}. Run with --list to see by-id / by-path names."
+        )
+    if len(links) > 1:
+        opts = ", ".join(r["link"] for r in links[:6])
+        raise RuntimeError(
+            f"Camera spec {raw!r} matches {len(links)} devices. Use a fuller path. Matches: {opts}"
+        )
+    link = links[0]["link"]
+    return (f"V4L2 {link}", link, cv2.CAP_V4L2)
 
 
 def configure_capture(
@@ -249,51 +316,76 @@ def configure_capture(
 
 
 def open_camera(
-    index: int,
+    spec: str | int,
     width: int | None = None,
     height: int | None = None,
 ) -> cv2.VideoCapture:
     w = DEFAULT_CAM_W if width is None else int(width)
     h = DEFAULT_CAM_H if height is None else int(height)
-    last_err = f"Could not open camera {index}."
-    seen: set[str] = set()
-
-    for name, source, backend in _open_targets(index):
-        if name in seen:
-            continue
-        seen.add(name)
-        print(f"  Trying {name} (MJPG {w}×{h})...")
-        cap = cv2.VideoCapture(source, backend)
-        if not cap.isOpened():
-            try:
-                cap.release()
-            except Exception:
-                pass
-            last_err = f"{name}: open failed (not a capture device?)."
-            continue
-
-        configure_capture(cap, width=w, height=h)
-
-        ok, frame = False, None
-        for _ in range(40):
-            ok, frame = cap.read()
-            if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
-                break
-            time.sleep(0.025)
-
-        if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
-            fh, fw = frame.shape[:2]
-            fourcc_s = _fourcc_to_str(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
-            print(f"  Camera {index} OK via {name} — {fw}×{fh} fourcc={fourcc_s!r}")
-            return cap
-
+    name, source, backend = resolve_camera_source(spec)
+    print(f"  Opening {name} (MJPG {w}×{h})...")
+    cap = cv2.VideoCapture(source, backend)
+    if not cap.isOpened():
         try:
             cap.release()
         except Exception:
             pass
-        last_err = f"{name}: opened but no frames at MJPG {w}×{h}."
+        raise RuntimeError(
+            f"Could not open {name}. "
+            "Pass the real capture node (e.g. /dev/video4, /dev/video1) or a by-id/by-path "
+            "*-video-index0 link. Run --list to see devices."
+        )
 
-    raise RuntimeError(last_err)
+    configure_capture(cap, width=w, height=h)
+
+    ok, frame = False, None
+    for attempt in range(40):
+        ok, frame = cap.read()
+        if ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any():
+            break
+        if attempt in (0, 9, 19, 39):
+            print(f"    … waiting for first frame ({attempt + 1}/40)")
+        time.sleep(0.025)
+
+    if not (ok and frame is not None and getattr(frame, "size", 0) > 0 and frame.any()):
+        try:
+            cap.release()
+        except Exception:
+            pass
+        raise RuntimeError(f"{name}: opened but no frames at MJPG {w}×{h}.")
+
+    fh, fw = frame.shape[:2]
+    fourcc_s = _fourcc_to_str(try_get(cap, cv2.CAP_PROP_FOURCC, 0.0))
+    print(f"  OK — {fw}×{fh} fourcc={fourcc_s!r}  (single-cam read OK)")
+    return cap
+
+
+def print_camera_list() -> None:
+    """Print indexes + stable by-id/by-path links for --list."""
+    print("Linux V4L camera links (prefer 'capture' + by-path if cams are identical):")
+    rows = list_linux_camera_links()
+    if not rows:
+        if platform.system() != "Linux":
+            print("  (only available on Linux/Pi)")
+        else:
+            print("  (none found under /dev/v4l/by-id or by-path)")
+    for r in rows:
+        print(f"  [{r['role']:9}] {r['kind']:7}  {r['device']:14}  {r['link']}")
+    print("\nQuick index probe (capture nodes only — may fail on metadata):")
+    for i in range(0, 8, 1):
+        dev = Path(f"/dev/video{i}")
+        if not dev.exists():
+            continue
+        # Skip obvious metadata indexes when by-id says so.
+        meta = any(
+            r["device"] == str(dev.resolve()) and r["role"] != "capture"
+            for r in rows
+            if Path(r["device"]).exists()
+        )
+        if meta:
+            print(f"  {i}: {dev}  (likely metadata — skip)")
+            continue
+        print(f"  {i}: {dev}")
 
 
 def read_cam(
@@ -301,10 +393,9 @@ def read_cam(
     retries: int = 5,
     flush: int = 0,
 ) -> tuple[bool, np.ndarray | None]:
-    """Read one frame; optional flush skips stale buffered frames."""
-    for _ in range(max(0, int(flush))):
-        if not cap.grab():
-            break
+    """Read one frame; optional single flush of one stale buffer slot."""
+    if flush > 0:
+        cap.grab()
     for _ in range(max(1, int(retries))):
         ok, frame = cap.read()
         if ok and frame is not None and getattr(frame, "size", 0) > 0:
@@ -313,47 +404,91 @@ def read_cam(
     return False, None
 
 
+def probe_dual_stream(
+    cap_l: cv2.VideoCapture,
+    cap_r: cv2.VideoCapture,
+    pairs: int = 40,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Alternate reads on both cams before YOLO / background threads.
+    Raises RuntimeError if simultaneous streaming fails.
+    """
+    print(f"  Dual-stream probe ({pairs} alternating reads)...")
+    ok_l = ok_r = 0
+    last_l = last_r = None
+    t0 = time.time()
+    for i in range(pairs):
+        l_ok, frame_l = read_cam(cap_l, retries=3, flush=0)
+        r_ok, frame_r = read_cam(cap_r, retries=3, flush=0)
+        if l_ok and frame_l is not None:
+            ok_l += 1
+            last_l = frame_l
+        if r_ok and frame_r is not None:
+            ok_r += 1
+            last_r = frame_r
+        if i % 10 == 9:
+            print(f"    pair {i + 1}/{pairs}: L={ok_l} R={ok_r} OK")
+        time.sleep(0.005)
+    dt = max(time.time() - t0, 1e-6)
+    print(
+        f"  Dual-stream result: L {ok_l}/{pairs}  R {ok_r}/{pairs}  "
+        f"in {dt:.2f}s (~{pairs / dt:.1f} pair/s)"
+    )
+    if last_l is None or last_r is None or ok_l < pairs // 2 or ok_r < pairs // 2:
+        raise RuntimeError(
+            "Simultaneous OpenCV streaming failed (select timeout / USB stall). "
+            "Both devices work alone with v4l2-ctl, so use MJPG 640x480, open BOTH "
+            "devices before any background reader, and prefer USB2/3 ports on different hubs."
+        )
+    return last_l, last_r
+
+
 class LatestFrameCam:
     """
-    Background reader that always keeps the newest frame.
-    Smooths the UI when the main thread stalls on YOLO.
+    Gentle background reader — one read() per tick, no grab-storm.
+    Aggressive grab()/retrieve loops cause V4L2 select() timeouts with dual UVC.
     """
 
-    def __init__(self, cap: cv2.VideoCapture) -> None:
+    def __init__(self, cap: cv2.VideoCapture, name: str = "cam") -> None:
         self.cap = cap
+        self.name = name
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
+        self._ok_reads = 0
+        self._fail_reads = 0
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="cam-latest", daemon=True)
+        self._thread = threading.Thread(
+            target=self._loop, name=f"cam-latest-{name}", daemon=True,
+        )
         self._thread.start()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            # Drop backlog so we display near-live frames, not old USB buffer.
-            for _ in range(2):
-                if not self.cap.grab():
-                    break
-            if not self.cap.grab():
-                time.sleep(0.005)
-                continue
-            ok, frame = self.cap.retrieve()
-            if not ok or frame is None or getattr(frame, "size", 0) == 0:
-                time.sleep(0.005)
-                continue
-            with self._lock:
-                self._frame = frame
+            ok, frame = self.cap.read()
+            if ok and frame is not None and getattr(frame, "size", 0) > 0:
+                with self._lock:
+                    self._frame = frame
+                    self._ok_reads += 1
+                # ~25 Hz max — leaves USB bandwidth for the sibling camera.
+                time.sleep(0.04)
+            else:
+                self._fail_reads += 1
+                time.sleep(0.02)
 
     def read(self, retries: int = 5) -> tuple[bool, np.ndarray | None]:
         for _ in range(max(1, int(retries))):
             with self._lock:
                 if self._frame is not None:
                     return True, self._frame.copy()
-            time.sleep(0.01)
+            time.sleep(0.02)
         return False, None
+
+    def stats(self) -> str:
+        return f"{self.name}: ok={self._ok_reads} fail={self._fail_reads}"
 
     def release(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        self._thread.join(timeout=1.5)
         try:
             self.cap.release()
         except Exception:

@@ -29,15 +29,22 @@ Put weights at `models/football_yolov8n.pt` (or train below).
 ## Run
 
 ```bash
-python capture/score_live.py --left 0 --right 2
+python capture/score_live.py --list
+python capture/score_live.py --left /dev/video4 --right /dev/video1
 ```
 
-(Arducam OV9281 pair: capture nodes are usually `/dev/video0` + `/dev/video2`.)
+Defaults are `/dev/video4` (left) and `/dev/video1` (right) for the current OV9281 pair. Confirm with `--list` / `v4l2-ctl` if your nodes differ.
 
-Pi / hand-held slow demo (much lighter YOLO):
+For stable selection (USB port), use `by-path` links from `--list`:
 
 ```bash
-python capture/score_live.py --left 0 --right 2 --slow-demo
+python capture/score_live.py --left /dev/v4l/by-path/...-video-index0 --right /dev/v4l/by-path/...-video-index0
+```
+
+Pi / hand-held slow demo:
+
+```bash
+python capture/score_live.py --left /dev/video4 --right /dev/video1 --slow-demo
 ```
 
 1. Align — click bottom then top of the far post on each camera, Enter  

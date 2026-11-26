@@ -205,9 +205,18 @@ def _mode_badge(img: np.ndarray, text: str, color: tuple[int, int, int]) -> None
 def main() -> int:
     on_pi = is_raspberry_pi()
     parser = argparse.ArgumentParser(description="Score live: Align → Play → Replay")
-    parser.add_argument("--left", type=int, default=0)
-    # OV9281 pair: video0 + video2 (video1/3 are metadata nodes, not capture).
-    parser.add_argument("--right", type=int, default=2)
+    parser.add_argument(
+        "--left",
+        type=str,
+        default="/dev/video4",
+        help="Left cam: index, /dev/videoN, or by-id/by-path (see --list)",
+    )
+    parser.add_argument(
+        "--right",
+        type=str,
+        default="/dev/video1",
+        help="Right cam: index, /dev/videoN, or by-id/by-path (see --list)",
+    )
     parser.add_argument("--baseline", type=float, default=cfg.BASELINE_M)
     parser.add_argument("--behind", type=float, default=cfg.CAM_BEHIND_POST_M)
     parser.add_argument("--h-angle", type=float, default=cfg.H_ANGLE_DEG)
@@ -265,18 +274,35 @@ def main() -> int:
         args.replay_s = PI_REPLAY_S if on_pi else REPLAY_S
 
     if args.list:
-        print("Probing cameras 0–5:")
-        for i in range(6):
+        plane.print_camera_list()
+        print("\nOpen-test capture candidates (MJPG):")
+        tested: set[str] = set()
+        for r in plane.list_linux_camera_links():
+            if r["role"] != "capture":
+                continue
+            key = r["device"]
+            if key in tested:
+                continue
+            tested.add(key)
             try:
-                cap = plane.open_camera(i, width=cam_w, height=cam_h)
-                print(f"  → {i} OK")
+                cap = plane.open_camera(r["link"], width=cam_w or plane.DEFAULT_CAM_W, height=cam_h or plane.DEFAULT_CAM_H)
+                print(f"  → OK  {r['link']}")
                 cap.release()
-                time.sleep(0.3)
+                time.sleep(0.2)
             except RuntimeError as e:
-                print(f"  → {i} FAIL: {e}")
+                print(f"  → FAIL {r['link']}: {e}")
+        if not tested:
+            for i in (0, 2, 1, 3, 4, 5):
+                try:
+                    cap = plane.open_camera(i, width=cam_w or plane.DEFAULT_CAM_W, height=cam_h or plane.DEFAULT_CAM_H)
+                    print(f"  → OK  index {i}")
+                    cap.release()
+                    time.sleep(0.2)
+                except RuntimeError as e:
+                    print(f"  → FAIL index {i}: {e}")
         return 0
 
-    if args.left == args.right:
+    if str(args.left).strip() == str(args.right).strip():
         print("ERROR: --left and --right must differ", file=sys.stderr)
         return 1
 
@@ -354,32 +380,41 @@ def main() -> int:
         cam_w = plane.DEFAULT_CAM_W if cam_w is None else int(cam_w)
         cam_h = plane.DEFAULT_CAM_H if cam_h is None else int(cam_h)
 
-        print(f"\nOpening left camera ({args.left}) @ MJPG {cam_w}×{cam_h}...")
+        # Open BOTH capture devices first (no background threads yet).
+        # Starting a reader on cam A before cam B is open causes V4L2 select() timeouts.
+        print(f"\nOpening left  ({args.left}) @ MJPG {cam_w}×{cam_h}...")
         raw_l = plane.open_camera(args.left, width=cam_w, height=cam_h)
-        time.sleep(0.3)
-        print(f"Opening right camera ({args.right}) @ MJPG {cam_w}×{cam_h}...")
+        time.sleep(0.2)
+        print(f"Opening right ({args.right}) @ MJPG {cam_w}×{cam_h}...")
         raw_r = plane.open_camera(args.right, width=cam_w, height=cam_h)
-        # Background readers keep the newest frames while YOLO runs (smoother video).
-        cap_l = plane.LatestFrameCam(raw_l)
-        cap_r = plane.LatestFrameCam(raw_r)
-        probe_l = probe_r = None
-        for _ in range(40):
-            ok_l, probe_l = cap_l.read(retries=1)
-            ok_r, probe_r = cap_r.read(retries=1)
-            if ok_l and ok_r and probe_l is not None and probe_r is not None:
-                break
-            time.sleep(0.05)
-        if probe_l is None or probe_r is None:
+
+        try:
+            probe_l, probe_r = plane.probe_dual_stream(raw_l, raw_r, pairs=40)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            raw_l.release()
+            raw_r.release()
+            return 1
+
+        # Only after dual streaming works: gentle per-camera reader threads.
+        cap_l = plane.LatestFrameCam(raw_l, name="L")
+        cap_r = plane.LatestFrameCam(raw_r, name="R")
+        time.sleep(0.3)
+        ok_l, live_l = cap_l.read(retries=20)
+        ok_r, live_r = cap_r.read(retries=20)
+        if not ok_l or not ok_r or live_l is None or live_r is None:
             print(
-                "ERROR: could not read initial frames from both cameras.\n"
-                "  Tip: use capture nodes (often --left 0 --right 2); "
-                "metadata nodes like /dev/video1 will time out.",
+                f"ERROR: background readers failed — {cap_l.stats()} | {cap_r.stats()}",
                 file=sys.stderr,
             )
             return 1
+        probe_l, probe_r = live_l, live_r
         raw_wh_l = (probe_l.shape[1], probe_l.shape[0])
         raw_wh_r = (probe_r.shape[1], probe_r.shape[0])
-        print(f"  Dual stream OK — L {raw_wh_l[0]}×{raw_wh_l[1]}  R {raw_wh_r[0]}×{raw_wh_r[1]}")
+        print(
+            f"  Dual stream OK — L {raw_wh_l[0]}×{raw_wh_l[1]}  R {raw_wh_r[0]}×{raw_wh_r[1]}  "
+            f"({cap_l.stats()} | {cap_r.stats()})"
+        )
 
         view_l = plane.orient_frame(probe_l, rotate_deg)
         view_r = plane.orient_frame(probe_r, rotate_deg)
