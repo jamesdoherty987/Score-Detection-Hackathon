@@ -804,7 +804,6 @@ def detect_both(
         verbose=False,
         device=device,
         max_det=1,
-        half=False,
     )
     if classes:
         kw["classes"] = classes
